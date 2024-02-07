@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -98,9 +98,52 @@ StringBuilder &operator<<(StringBuilder &string_builder, MessageContentType cont
       return string_builder << "Dice";
     case MessageContentType::ProximityAlertTriggered:
       return string_builder << "ProximityAlertTriggered";
+    case MessageContentType::GroupCall:
+      return string_builder << "GroupCall";
+    case MessageContentType::InviteToGroupCall:
+      return string_builder << "InviteToGroupCall";
+    case MessageContentType::ChatSetTheme:
+      return string_builder << "ChatSetTheme";
+    case MessageContentType::WebViewDataSent:
+      return string_builder << "WebViewDataSent";
+    case MessageContentType::WebViewDataReceived:
+      return string_builder << "WebViewDataReceived";
+    case MessageContentType::GiftPremium:
+      return string_builder << "GiftPremium";
+    case MessageContentType::TopicCreate:
+      return string_builder << "TopicCreate";
+    case MessageContentType::TopicEdit:
+      return string_builder << "TopicEdit";
+    case MessageContentType::SuggestProfilePhoto:
+      return string_builder << "SuggestProfilePhoto";
+    case MessageContentType::WriteAccessAllowed:
+      return string_builder << "WriteAccessAllowed";
+    case MessageContentType::RequestedDialog:
+      return string_builder << "ChatShared";
+    case MessageContentType::WebViewWriteAccessAllowed:
+      return string_builder << "WebAppWriteAccessAllowed";
+    case MessageContentType::SetBackground:
+      return string_builder << "SetBackground";
+    case MessageContentType::Story:
+      return string_builder << "Story";
+    case MessageContentType::WriteAccessAllowedByRequest:
+      return string_builder << "WriteAccessAllowedByRequest";
+    case MessageContentType::GiftCode:
+      return string_builder << "GiftCode";
+    case MessageContentType::Giveaway:
+      return string_builder << "Giveaway";
+    case MessageContentType::GiveawayLaunch:
+      return string_builder << "GiveawayLaunch";
+    case MessageContentType::GiveawayResults:
+      return string_builder << "GiveawayResults";
+    case MessageContentType::GiveawayWinners:
+      return string_builder << "GiveawayWinners";
+    case MessageContentType::ExpiredVideoNote:
+      return string_builder << "ExpiredVideoNote";
+    case MessageContentType::ExpiredVoiceNote:
+      return string_builder << "ExpiredVoiceNote";
     default:
-      UNREACHABLE();
-      return string_builder;
+      return string_builder << "Invalid type " << static_cast<int32>(content_type);
   }
 }
 
@@ -150,6 +193,28 @@ bool is_allowed_media_group_content(MessageContentType content_type) {
     case MessageContentType::Poll:
     case MessageContentType::Dice:
     case MessageContentType::ProximityAlertTriggered:
+    case MessageContentType::GroupCall:
+    case MessageContentType::InviteToGroupCall:
+    case MessageContentType::ChatSetTheme:
+    case MessageContentType::WebViewDataSent:
+    case MessageContentType::WebViewDataReceived:
+    case MessageContentType::GiftPremium:
+    case MessageContentType::TopicCreate:
+    case MessageContentType::TopicEdit:
+    case MessageContentType::SuggestProfilePhoto:
+    case MessageContentType::WriteAccessAllowed:
+    case MessageContentType::RequestedDialog:
+    case MessageContentType::WebViewWriteAccessAllowed:
+    case MessageContentType::SetBackground:
+    case MessageContentType::Story:
+    case MessageContentType::WriteAccessAllowedByRequest:
+    case MessageContentType::GiftCode:
+    case MessageContentType::Giveaway:
+    case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
+    case MessageContentType::GiveawayWinners:
+    case MessageContentType::ExpiredVideoNote:
+    case MessageContentType::ExpiredVoiceNote:
       return false;
     default:
       UNREACHABLE();
@@ -161,10 +226,7 @@ bool is_homogenous_media_group_content(MessageContentType content_type) {
   return content_type == MessageContentType::Audio || content_type == MessageContentType::Document;
 }
 
-bool is_secret_message_content(int32 ttl, MessageContentType content_type) {
-  if (ttl <= 0 || ttl > 60) {
-    return false;
-  }
+bool can_be_secret_message_content(MessageContentType content_type) {
   switch (content_type) {
     case MessageContentType::Animation:
     case MessageContentType::Audio:
@@ -210,6 +272,28 @@ bool is_secret_message_content(int32 ttl, MessageContentType content_type) {
     case MessageContentType::Poll:
     case MessageContentType::Dice:
     case MessageContentType::ProximityAlertTriggered:
+    case MessageContentType::GroupCall:
+    case MessageContentType::InviteToGroupCall:
+    case MessageContentType::ChatSetTheme:
+    case MessageContentType::WebViewDataSent:
+    case MessageContentType::WebViewDataReceived:
+    case MessageContentType::GiftPremium:
+    case MessageContentType::TopicCreate:
+    case MessageContentType::TopicEdit:
+    case MessageContentType::SuggestProfilePhoto:
+    case MessageContentType::WriteAccessAllowed:
+    case MessageContentType::RequestedDialog:
+    case MessageContentType::WebViewWriteAccessAllowed:
+    case MessageContentType::SetBackground:
+    case MessageContentType::Story:
+    case MessageContentType::WriteAccessAllowedByRequest:
+    case MessageContentType::GiftCode:
+    case MessageContentType::Giveaway:
+    case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
+    case MessageContentType::GiveawayWinners:
+    case MessageContentType::ExpiredVideoNote:
+    case MessageContentType::ExpiredVoiceNote:
       return false;
     default:
       UNREACHABLE();
@@ -222,23 +306,28 @@ bool is_service_message_content(MessageContentType content_type) {
     case MessageContentType::Animation:
     case MessageContentType::Audio:
     case MessageContentType::Contact:
+    case MessageContentType::Dice:
     case MessageContentType::Document:
+    case MessageContentType::ExpiredPhoto:
+    case MessageContentType::ExpiredVideo:
+    case MessageContentType::ExpiredVideoNote:
+    case MessageContentType::ExpiredVoiceNote:
     case MessageContentType::Game:
+    case MessageContentType::Giveaway:
+    case MessageContentType::GiveawayWinners:
     case MessageContentType::Invoice:
     case MessageContentType::LiveLocation:
     case MessageContentType::Location:
     case MessageContentType::Photo:
+    case MessageContentType::Poll:
     case MessageContentType::Sticker:
+    case MessageContentType::Story:
     case MessageContentType::Text:
     case MessageContentType::Unsupported:
     case MessageContentType::Venue:
     case MessageContentType::Video:
     case MessageContentType::VideoNote:
     case MessageContentType::VoiceNote:
-    case MessageContentType::ExpiredPhoto:
-    case MessageContentType::ExpiredVideo:
-    case MessageContentType::Poll:
-    case MessageContentType::Dice:
       return false;
     case MessageContentType::ChatCreate:
     case MessageContentType::ChatChangeTitle:
@@ -263,9 +352,74 @@ bool is_service_message_content(MessageContentType content_type) {
     case MessageContentType::PassportDataSent:
     case MessageContentType::PassportDataReceived:
     case MessageContentType::ProximityAlertTriggered:
+    case MessageContentType::GroupCall:
+    case MessageContentType::InviteToGroupCall:
+    case MessageContentType::ChatSetTheme:
+    case MessageContentType::WebViewDataSent:
+    case MessageContentType::WebViewDataReceived:
+    case MessageContentType::GiftPremium:
+    case MessageContentType::TopicCreate:
+    case MessageContentType::TopicEdit:
+    case MessageContentType::SuggestProfilePhoto:
+    case MessageContentType::WriteAccessAllowed:
+    case MessageContentType::RequestedDialog:
+    case MessageContentType::WebViewWriteAccessAllowed:
+    case MessageContentType::SetBackground:
+    case MessageContentType::WriteAccessAllowedByRequest:
+    case MessageContentType::GiftCode:
+    case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
       return true;
     default:
       UNREACHABLE();
+      return false;
+  }
+}
+
+bool is_supported_reply_message_content(MessageContentType content_type) {
+  switch (content_type) {
+    case MessageContentType::Animation:
+    case MessageContentType::Audio:
+    case MessageContentType::Contact:
+    case MessageContentType::Dice:
+    case MessageContentType::Document:
+    case MessageContentType::Game:
+    case MessageContentType::Giveaway:
+    case MessageContentType::GiveawayWinners:
+    case MessageContentType::Invoice:
+    case MessageContentType::Location:
+    case MessageContentType::Photo:
+    case MessageContentType::Poll:
+    case MessageContentType::Sticker:
+    case MessageContentType::Story:
+    case MessageContentType::Text:
+    case MessageContentType::Unsupported:
+    case MessageContentType::Venue:
+    case MessageContentType::Video:
+    case MessageContentType::VideoNote:
+    case MessageContentType::VoiceNote:
+      // update documentation when the list changes
+      return true;
+    case MessageContentType::ExpiredPhoto:
+    case MessageContentType::ExpiredVideo:
+    case MessageContentType::ExpiredVideoNote:
+    case MessageContentType::ExpiredVoiceNote:
+    case MessageContentType::LiveLocation:
+      return false;
+    default:
+      UNREACHABLE();
+      return false;
+  }
+}
+
+bool is_expired_message_content(MessageContentType content_type) {
+  switch (content_type) {
+    case MessageContentType::ExpiredPhoto:
+    case MessageContentType::ExpiredVideo:
+    case MessageContentType::ExpiredVideoNote:
+    case MessageContentType::ExpiredVoiceNote:
+      return true;
+    default:
       return false;
   }
 }
@@ -316,10 +470,49 @@ bool can_have_message_content_caption(MessageContentType content_type) {
     case MessageContentType::Poll:
     case MessageContentType::Dice:
     case MessageContentType::ProximityAlertTriggered:
+    case MessageContentType::GroupCall:
+    case MessageContentType::InviteToGroupCall:
+    case MessageContentType::ChatSetTheme:
+    case MessageContentType::WebViewDataSent:
+    case MessageContentType::WebViewDataReceived:
+    case MessageContentType::GiftPremium:
+    case MessageContentType::TopicCreate:
+    case MessageContentType::TopicEdit:
+    case MessageContentType::SuggestProfilePhoto:
+    case MessageContentType::WriteAccessAllowed:
+    case MessageContentType::RequestedDialog:
+    case MessageContentType::WebViewWriteAccessAllowed:
+    case MessageContentType::SetBackground:
+    case MessageContentType::Story:
+    case MessageContentType::WriteAccessAllowedByRequest:
+    case MessageContentType::GiftCode:
+    case MessageContentType::Giveaway:
+    case MessageContentType::GiveawayLaunch:
+    case MessageContentType::GiveawayResults:
+    case MessageContentType::GiveawayWinners:
+    case MessageContentType::ExpiredVideoNote:
+    case MessageContentType::ExpiredVoiceNote:
       return false;
     default:
       UNREACHABLE();
       return false;
+  }
+}
+
+uint64 get_message_content_chain_id(MessageContentType content_type) {
+  switch (content_type) {
+    case MessageContentType::Animation:
+    case MessageContentType::Audio:
+    case MessageContentType::Document:
+    case MessageContentType::Invoice:
+    case MessageContentType::Photo:
+    case MessageContentType::Sticker:
+    case MessageContentType::Video:
+    case MessageContentType::VideoNote:
+    case MessageContentType::VoiceNote:
+      return 1;
+    default:
+      return 2;
   }
 }
 

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -12,8 +12,8 @@
 #include "td/utils/logging.h"
 #include "td/utils/Observer.h"
 #include "td/utils/port/detail/NativeFd.h"
+#include "td/utils/port/Mutex.h"
 #include "td/utils/port/PollFlags.h"
-#include "td/utils/SpinLock.h"
 
 #include <atomic>
 #include <memory>
@@ -60,7 +60,7 @@ inline PollableFd PollableFdRef::lock() {
   return PollableFd::from_list_node(list_node_);
 }
 
-class PollableFdInfo : private ListNode {
+class PollableFdInfo final : private ListNode {
  public:
   PollableFdInfo() = default;
   PollableFdInfo(const PollableFdInfo &) = delete;
@@ -140,7 +140,7 @@ class PollableFdInfo : private ListNode {
   std::atomic_flag lock_ = ATOMIC_FLAG_INIT;
   PollFlagsSet flags_;
 #if TD_PORT_WINDOWS
-  SpinLock observer_lock_;
+  Mutex observer_lock_;
 #endif
   ObserverBase *observer_{nullptr};
 
@@ -151,7 +151,7 @@ class PollableFdInfo : private ListNode {
 #if TD_PORT_WINDOWS
     auto lock = observer_lock_.lock();
 #endif
-    CHECK(!observer_);
+    CHECK(observer_ == nullptr);
     observer_ = observer;
   }
   void clear_observer() {
@@ -165,7 +165,7 @@ class PollableFdInfo : private ListNode {
     auto lock = observer_lock_.lock();
 #endif
     VLOG(fd) << native_fd() << " notify " << tag("observer", observer_);
-    if (observer_) {
+    if (observer_ != nullptr) {
       observer_->notify();
     }
   }

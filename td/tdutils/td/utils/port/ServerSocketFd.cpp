@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -13,6 +13,7 @@
 #include "td/utils/port/detail/skip_eintr.h"
 #include "td/utils/port/IPAddress.h"
 #include "td/utils/port/PollFlags.h"
+#include "td/utils/SliceBuilder.h"
 
 #if TD_PORT_POSIX
 #include <cerrno>
@@ -28,7 +29,7 @@
 
 #if TD_PORT_WINDOWS
 #include "td/utils/port/detail/Iocp.h"
-#include "td/utils/SpinLock.h"
+#include "td/utils/port/Mutex.h"
 #include "td/utils/VectorQueue.h"
 #endif
 
@@ -39,7 +40,7 @@ namespace td {
 
 namespace detail {
 #if TD_PORT_WINDOWS
-class ServerSocketFdImpl : private Iocp::Callback {
+class ServerSocketFdImpl final : private Iocp::Callback {
  public:
   ServerSocketFdImpl(NativeFd fd, int socket_family) : info_(std::move(fd)), socket_family_(socket_family) {
     VLOG(fd) << get_native_fd() << " create ServerSocketFd";
@@ -86,7 +87,7 @@ class ServerSocketFdImpl : private Iocp::Callback {
  private:
   PollableFdInfo info_;
 
-  SpinLock lock_;
+  Mutex lock_;
   VectorQueue<SocketFd> accepted_;
   VectorQueue<Status> pending_errors_;
   static constexpr size_t MAX_ADDR_SIZE = sizeof(sockaddr_in6) + 16;
@@ -171,7 +172,7 @@ class ServerSocketFdImpl : private Iocp::Callback {
     get_poll_info().add_flags_from_poll(PollFlags::Error());
   }
 
-  void on_iocp(Result<size_t> r_size, WSAOVERLAPPED *overlapped) override {
+  void on_iocp(Result<size_t> r_size, WSAOVERLAPPED *overlapped) final {
     // called from other thread
     if (dec_refcnt() || close_flag_) {
       VLOG(fd) << "Ignore IOCP (server socket is closing)";
@@ -281,8 +282,8 @@ void ServerSocketFdImplDeleter::operator()(ServerSocketFdImpl *impl) {
 }  // namespace detail
 
 ServerSocketFd::ServerSocketFd() = default;
-ServerSocketFd::ServerSocketFd(ServerSocketFd &&) = default;
-ServerSocketFd &ServerSocketFd::operator=(ServerSocketFd &&) = default;
+ServerSocketFd::ServerSocketFd(ServerSocketFd &&) noexcept = default;
+ServerSocketFd &ServerSocketFd::operator=(ServerSocketFd &&) noexcept = default;
 ServerSocketFd::~ServerSocketFd() = default;
 ServerSocketFd::ServerSocketFd(unique_ptr<detail::ServerSocketFdImpl> impl) : impl_(impl.release()) {
 }
@@ -337,7 +338,11 @@ Result<ServerSocketFd> ServerSocketFd::open(int32 port, CSlice addr) {
   setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, reinterpret_cast<const char *>(&flags), sizeof(flags));
 #endif
 #elif TD_PORT_WINDOWS
-  BOOL flags = TRUE;
+  BOOL flags = FALSE;
+  if (address.is_ipv6()) {
+    setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char *>(&flags), sizeof(flags));
+  }
+  flags = TRUE;
 #endif
   setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&flags), sizeof(flags));
   setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char *>(&flags), sizeof(flags));

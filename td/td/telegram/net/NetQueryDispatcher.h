@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -10,9 +10,9 @@
 #include "td/telegram/net/NetQuery.h"
 
 #include "td/actor/actor.h"
-#include "td/actor/PromiseFuture.h"
 
 #include "td/utils/common.h"
+#include "td/utils/Promise.h"
 #include "td/utils/ScopeGuard.h"
 #include "td/utils/Status.h"
 
@@ -25,16 +25,15 @@
 namespace td {
 
 class DcAuthManager;
+class MultiSequenceDispatcher;
 class NetQueryDelayer;
-class PublicRsaKeyShared;
 class PublicRsaKeyWatchdog;
 class SessionMultiProxy;
 
 // Not just dispatcher.
 class NetQueryDispatcher {
  public:
-  explicit NetQueryDispatcher(std::function<ActorShared<>()> create_reference);
-  NetQueryDispatcher();
+  explicit NetQueryDispatcher(const std::function<ActorShared<>()> &create_reference);
   NetQueryDispatcher(const NetQueryDispatcher &) = delete;
   NetQueryDispatcher &operator=(const NetQueryDispatcher &) = delete;
   NetQueryDispatcher(NetQueryDispatcher &&) = delete;
@@ -50,19 +49,19 @@ class NetQueryDispatcher {
   void update_use_pfs();
   void update_mtproto_header();
 
-  void update_valid_dc(DcId dc_id);
-
-  DcId main_dc_id() const {
-    return DcId::internal(main_dc_id_.load());
+  DcId get_main_dc_id() const {
+    return DcId::internal(main_dc_id_.load(std::memory_order_relaxed));
   }
 
   void set_main_dc_id(int32 new_main_dc_id);
+  void check_authorization_is_ok();
 
  private:
   std::atomic<bool> stop_flag_{false};
   bool need_destroy_auth_key_{false};
   ActorOwn<NetQueryDelayer> delayer_;
   ActorOwn<DcAuthManager> dc_auth_manager_;
+  ActorOwn<MultiSequenceDispatcher> sequence_dispatcher_;
   struct Dc {
     DcId id_;
     std::atomic<bool> is_valid_{false};
@@ -73,14 +72,12 @@ class NetQueryDispatcher {
     ActorOwn<SessionMultiProxy> download_small_session_;
     ActorOwn<SessionMultiProxy> upload_session_;
   };
-  static constexpr size_t MAX_DC_COUNT = 1000;
-  std::array<Dc, MAX_DC_COUNT> dcs_;
+  std::array<Dc, DcId::MAX_RAW_DC_ID> dcs_;
 #if TD_EMSCRIPTEN  // FIXME
   std::atomic<int32> main_dc_id_{2};
 #else
   std::atomic<int32> main_dc_id_{1};
 #endif
-  std::shared_ptr<PublicRsaKeyShared> common_public_rsa_key_;
   ActorOwn<PublicRsaKeyWatchdog> public_rsa_key_watchdog_;
   std::mutex main_dc_id_mutex_;
   std::shared_ptr<Guard> td_guard_;
@@ -88,6 +85,7 @@ class NetQueryDispatcher {
   Status wait_dc_init(DcId dc_id, bool force);
   bool is_dc_inited(int32 raw_dc_id);
 
+  static int32 get_main_session_scheduler_id();
   static int32 get_session_count();
   static bool get_use_pfs();
 

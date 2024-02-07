@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -11,9 +11,9 @@
 
 namespace td {
 
-Venue::Venue(const tl_object_ptr<telegram_api::GeoPoint> &geo_point_ptr, string title, string address, string provider,
-             string id, string type)
-    : location_(geo_point_ptr)
+Venue::Venue(Td *td, const tl_object_ptr<telegram_api::GeoPoint> &geo_point_ptr, string title, string address,
+             string provider, string id, string type)
+    : location_(td, geo_point_ptr)
     , title_(std::move(title))
     , address_(std::move(address))
     , provider_(std::move(provider))
@@ -67,9 +67,19 @@ SecretInputMedia Venue::get_secret_input_media_venue() const {
 }
 
 tl_object_ptr<telegram_api::inputBotInlineMessageMediaVenue> Venue::get_input_bot_inline_message_media_venue(
-    int32 flags, tl_object_ptr<telegram_api::ReplyMarkup> &&reply_markup) const {
+    tl_object_ptr<telegram_api::ReplyMarkup> &&reply_markup) const {
+  int32 flags = 0;
+  if (reply_markup != nullptr) {
+    flags |= telegram_api::inputBotInlineMessageMediaVenue::REPLY_MARKUP_MASK;
+  }
   return make_tl_object<telegram_api::inputBotInlineMessageMediaVenue>(
       flags, location_.get_input_geo_point(), title_, address_, provider_, id_, type_, std::move(reply_markup));
+}
+
+telegram_api::object_ptr<telegram_api::mediaAreaVenue> Venue::get_input_media_area_venue(
+    telegram_api::object_ptr<telegram_api::mediaAreaCoordinates> &&coordinates) const {
+  return telegram_api::make_object<telegram_api::mediaAreaVenue>(std::move(coordinates), location_.get_fake_geo_point(),
+                                                                 title_, address_, provider_, id_, type_);
 }
 
 bool operator==(const Venue &lhs, const Venue &rhs) {
@@ -84,16 +94,15 @@ bool operator!=(const Venue &lhs, const Venue &rhs) {
 StringBuilder &operator<<(StringBuilder &string_builder, const Venue &venue) {
   return string_builder << "Venue[location = " << venue.location_ << ", title = " << venue.title_
                         << ", address = " << venue.address_ << ", provider = " << venue.provider_
-                        << ", id = " << venue.id_ << ", type = " << venue.type_ << "]";
+                        << ", ID = " << venue.id_ << ", type = " << venue.type_ << "]";
 }
 
 Result<Venue> process_input_message_venue(tl_object_ptr<td_api::InputMessageContent> &&input_message_content) {
   CHECK(input_message_content != nullptr);
   CHECK(input_message_content->get_id() == td_api::inputMessageVenue::ID);
   auto venue = std::move(static_cast<td_api::inputMessageVenue *>(input_message_content.get())->venue_);
-
   if (venue == nullptr) {
-    return Status::Error(400, "Venue can't be empty");
+    return Status::Error(400, "Venue must be non-empty");
   }
 
   if (!clean_input_string(venue->title_)) {

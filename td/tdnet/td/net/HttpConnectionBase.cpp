@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -16,7 +16,7 @@
 namespace td {
 namespace detail {
 
-HttpConnectionBase::HttpConnectionBase(State state, SocketFd fd, SslStream ssl_stream, size_t max_post_size,
+HttpConnectionBase::HttpConnectionBase(State state, BufferedFd<SocketFd> fd, SslStream ssl_stream, size_t max_post_size,
                                        size_t max_files, int32 idle_timeout, int32 slow_scheduler_id)
     : state_(state)
     , fd_(std::move(fd))
@@ -102,7 +102,7 @@ void HttpConnectionBase::loop() {
     LOG(DEBUG) << "Can read from the connection";
     auto r = fd_.flush_read();
     if (r.is_error()) {
-      if (!begins_with(r.error().message(), "SSL error {336134278")) {  // if error is not yet outputed
+      if (!begins_with(r.error().message(), "SSL error {336134278")) {  // if error is not yet outputted
         LOG(INFO) << "Receive flush_read error: " << r.error();
       }
       on_error(Status::Error(r.error().public_message()));
@@ -128,7 +128,11 @@ void HttpConnectionBase::loop() {
       }
       live_event();
       state_ = State::Write;
-      LOG(INFO) << res.error();
+      if (res.error().code() == 500) {
+        LOG(WARNING) << "Failed to process an HTTP query: " << res.error();
+      } else {
+        LOG(INFO) << res.error();
+      }
       HttpHeaderCreator hc;
       hc.init_status_line(res.error().code());
       hc.set_content_size(0);
@@ -183,9 +187,12 @@ void HttpConnectionBase::loop() {
     state_ = State::Close;
   }
   if (state_ == State::Close) {
-    LOG_IF(INFO, fd_.need_flush_write()) << "Close nonempty connection";
-    LOG_IF(INFO, want_read && (fd_.input_buffer().size() > 0 || current_query_->type_ != HttpQuery::Type::Empty))
-        << "Close connection while reading request/response";
+    if (fd_.need_flush_write()) {
+      LOG(INFO) << "Close nonempty connection";
+    }
+    if (want_read && (!fd_.input_buffer().empty() || current_query_->type_ != HttpQuery::Type::Empty)) {
+      LOG(INFO) << "Close connection while reading request/response";
+    }
     return stop();
   }
 }
@@ -196,6 +203,7 @@ void HttpConnectionBase::on_start_migrate(int32 sched_id) {
 
 void HttpConnectionBase::on_finish_migrate() {
   Scheduler::subscribe(fd_.get_poll_info().extract_pollable_fd(this));
+  live_event();
 }
 
 }  // namespace detail

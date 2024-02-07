@@ -1,5 +1,6 @@
 package com.fansmore.api;
 
+import com.fansmore.api.common.Constant;
 import com.fansmore.api.execute.ActuatorManager;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -24,6 +25,7 @@ public class Application implements ApplicationRunner {
     public void run(ApplicationArguments args) throws Exception {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             ActuatorManager.getInstance().closeAll();
+            Constant.CACHED_THREAD_POOL.shutdown();
             try {
                 Thread.sleep(5000);
             } catch (InterruptedException e) {

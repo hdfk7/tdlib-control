@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -21,8 +21,6 @@
 #include "td/utils/tl_helpers.h"
 #include "td/utils/tl_parsers.h"
 #include "td/utils/tl_storers.h"
-
-#include <type_traits>
 
 namespace td {
 namespace log_event {
@@ -74,35 +72,56 @@ class LogEvent {
     StopPoll = 0x21,
     SendMessage = 0x100,
     DeleteMessage = 0x101,
-    DeleteMessagesFromServer = 0x102,
+    DeleteMessagesOnServer = 0x102,
     ReadHistoryOnServer = 0x103,
     ForwardMessages = 0x104,
     ReadMessageContentsOnServer = 0x105,
     SendBotStartMessage = 0x106,
     SendScreenshotTakenNotificationMessage = 0x107,
     SendInlineQueryResultMessage = 0x108,
-    DeleteDialogHistoryFromServer = 0x109,
+    DeleteDialogHistoryOnServer = 0x109,
     ReadAllDialogMentionsOnServer = 0x10a,
-    DeleteAllChannelMessagesFromUserOnServer = 0x10b,
+    DeleteAllChannelMessagesFromSenderOnServer = 0x10b,
     ToggleDialogIsPinnedOnServer = 0x10c,
     ReorderPinnedDialogsOnServer = 0x10d,
     SaveDialogDraftMessageOnServer = 0x10e,
     UpdateDialogNotificationSettingsOnServer = 0x10f,
     UpdateScopeNotificationSettingsOnServer = 0x110,
     ResetAllNotificationSettingsOnServer = 0x111,
-    ChangeDialogReportSpamStateOnServer = 0x112,
-    GetDialogFromServer = 0x113,
+    ToggleDialogReportSpamStateOnServer = 0x112,
+    RegetDialog = 0x113,
     ReadHistoryInSecretChat = 0x114,
     ToggleDialogIsMarkedAsUnreadOnServer = 0x115,
     SetDialogFolderIdOnServer = 0x116,
-    DeleteScheduledMessagesFromServer = 0x117,
+    DeleteScheduledMessagesOnServer = 0x117,
     ToggleDialogIsBlockedOnServer = 0x118,
     ReadMessageThreadHistoryOnServer = 0x119,
     BlockMessageSenderFromRepliesOnServer = 0x120,
     UnpinAllDialogMessagesOnServer = 0x121,
+    DeleteAllCallMessagesOnServer = 0x122,
+    DeleteDialogMessagesByDateOnServer = 0x123,
+    ReadAllDialogReactionsOnServer = 0x124,
+    DeleteTopicHistoryOnServer = 0x125,
+    ToggleDialogIsTranslatableOnServer = 0x126,
+    ToggleDialogViewAsMessagesOnServer = 0x127,
     GetChannelDifference = 0x140,
     AddMessagePushNotification = 0x200,
     EditMessagePushNotification = 0x201,
+    SaveAppLog = 0x300,
+    DeleteStoryOnServer = 0x400,
+    ReadStoriesOnServer = 0x401,
+    LoadDialogExpiringStories = 0x402,
+    SendStory = 0x403,
+    EditStory = 0x404,
+    ChangeAuthorizationSettingsOnServer = 0x500,
+    ResetAuthorizationOnServer = 0x501,
+    ResetAuthorizationsOnServer = 0x502,
+    SetDefaultHistoryTtlOnServer = 0x503,
+    SetAccountTtlOnServer = 0x504,
+    SetAuthorizationTtlOnServer = 0x505,
+    ResetWebAuthorizationOnServer = 0x506,
+    ResetWebAuthorizationsOnServer = 0x507,
+    InvalidateSignInCodesOnServer = 0x508,
     ConfigPmcMagic = 0x1f18,
     BinlogPmcMagic = 0x4327
   };
@@ -123,93 +142,12 @@ class LogEvent {
  private:
   Id log_event_id_{};
 };
+
 inline StringBuilder &operator<<(StringBuilder &sb, const LogEvent &log_event) {
   return log_event.print(sb);
 }
 
-namespace detail {
-
-template <class EventT>
-int32 magic(EventT &event) {
-  return static_cast<int32>(event.get_type());
-}
-
-template <class EventT, class StorerT>
-void store(const EventT &event, StorerT &storer) {
-  EventT::downcast_call(event.get_type(),
-                        [&](auto *ptr) { static_cast<const std::decay_t<decltype(*ptr)> &>(event).store(storer); });
-}
-
-template <class DestT, class T>
-Result<unique_ptr<DestT>> from_parser(T &&parser) {
-  auto version = parser.fetch_int();
-  parser.set_version(version);
-  parser.set_context(G());
-  auto magic = static_cast<typename DestT::Type>(parser.fetch_int());
-
-  unique_ptr<DestT> event;
-  DestT::downcast_call(magic, [&](auto *ptr) {
-    auto tmp = make_unique<std::decay_t<decltype(*ptr)>>();
-    tmp->parse(parser);
-    event = std::move(tmp);
-  });
-  parser.fetch_end();
-  TRY_STATUS(parser.get_status());
-  if (event) {
-    return std::move(event);
-  }
-  return Status::Error(PSLICE() << "Unknown SecretChatEvent type: " << format::as_hex(magic));
-}
-
-template <class DestT>
-Result<unique_ptr<DestT>> from_buffer_slice(BufferSlice slice) {
-  return from_parser<DestT>(WithVersion<WithContext<TlBufferParser, Global *>>{&slice});
-}
-
-template <class T>
-class StorerImpl : public Storer {
- public:
-  explicit StorerImpl(const T &event) : event_(event) {
-  }
-
-  size_t size() const override {
-    WithContext<TlStorerCalcLength, Global *> storer;
-    storer.set_context(G());
-
-    storer.store_int(T::version());
-    td::store(magic(event_), storer);
-    td::store(event_, storer);
-    return storer.get_length();
-  }
-  size_t store(uint8 *ptr) const override {
-    WithContext<TlStorerUnsafe, Global *> storer(ptr);
-    storer.set_context(G());
-
-    storer.store_int(T::version());
-    td::store(magic(event_), storer);
-    td::store(event_, storer);
-    return static_cast<size_t>(storer.get_buf() - ptr);
-  }
-
- private:
-  const T &event_;
-};
-
-}  // namespace detail
-
-template <class ChildT>
-class LogEventBase : public LogEvent {
- public:
-  template <class StorerT>
-  void store(StorerT &storer) const {
-    detail::store(static_cast<const ChildT &>(*this), storer);
-  }
-  static Result<unique_ptr<ChildT>> from_buffer_slice(BufferSlice slice) {
-    return detail::from_buffer_slice<ChildT>(std::move(slice));
-  }
-};
-
-class LogEventParser : public WithVersion<WithContext<TlParser, Global *>> {
+class LogEventParser final : public WithVersion<WithContext<TlParser, Global *>> {
  public:
   explicit LogEventParser(Slice data) : WithVersion<WithContext<TlParser, Global *>>(data) {
     set_version(fetch_int());
@@ -218,7 +156,7 @@ class LogEventParser : public WithVersion<WithContext<TlParser, Global *>> {
   }
 };
 
-class LogEventStorerCalcLength : public WithContext<TlStorerCalcLength, Global *> {
+class LogEventStorerCalcLength final : public WithContext<TlStorerCalcLength, Global *> {
  public:
   LogEventStorerCalcLength() : WithContext<TlStorerCalcLength, Global *>() {
     store_int(static_cast<int32>(Version::Next) - 1);
@@ -226,7 +164,7 @@ class LogEventStorerCalcLength : public WithContext<TlStorerCalcLength, Global *
   }
 };
 
-class LogEventStorerUnsafe : public WithContext<TlStorerUnsafe, Global *> {
+class LogEventStorerUnsafe final : public WithContext<TlStorerUnsafe, Global *> {
  public:
   explicit LogEventStorerUnsafe(unsigned char *buf) : WithContext<TlStorerUnsafe, Global *>(buf) {
     store_int(static_cast<int32>(Version::Next) - 1);
@@ -235,17 +173,17 @@ class LogEventStorerUnsafe : public WithContext<TlStorerUnsafe, Global *> {
 };
 
 template <class T>
-class LogEventStorerImpl : public Storer {
+class LogEventStorerImpl final : public Storer {
  public:
   explicit LogEventStorerImpl(const T &event) : event_(event) {
   }
 
-  size_t size() const override {
+  size_t size() const final {
     LogEventStorerCalcLength storer;
     td::store(event_, storer);
     return storer.get_length();
   }
-  size_t store(uint8 *ptr) const override {
+  size_t store(uint8 *ptr) const final {
     LogEventStorerUnsafe storer(ptr);
     td::store(event_, storer);
 #ifdef TD_DEBUG
@@ -277,13 +215,18 @@ Status log_event_parse(T &data, Slice slice) {
   return parser.get_status();
 }
 
+inline int32 log_event_get_version(Slice slice) {
+  LogEventParser parser(slice);
+  return parser.version();
+}
+
 template <class T>
-BufferSlice log_event_store(const T &data) {
+BufferSlice log_event_store_impl(const T &data, const char *file, int line) {
   LogEventStorerCalcLength storer_calc_length;
   store(data, storer_calc_length);
 
   BufferSlice value_buffer{storer_calc_length.get_length()};
-  auto ptr = value_buffer.as_slice().ubegin();
+  auto ptr = value_buffer.as_mutable_slice().ubegin();
   LOG_CHECK(is_aligned_pointer<4>(ptr)) << ptr;
 
   LogEventStorerUnsafe storer_unsafe(ptr);
@@ -291,10 +234,15 @@ BufferSlice log_event_store(const T &data) {
 
 #ifdef TD_DEBUG
   T check_result;
-  log_event_parse(check_result, value_buffer.as_slice()).ensure();
+  auto status = log_event_parse(check_result, value_buffer.as_slice());
+  if (status.is_error()) {
+    LOG(FATAL) << status << ' ' << file << ' ' << line;
+  }
 #endif
   return value_buffer;
 }
+
+#define log_event_store(data) log_event_store_impl((data), __FILE__, __LINE__)
 
 template <class T>
 log_event::LogEventStorerImpl<T> get_log_event_storer(const T &event) {

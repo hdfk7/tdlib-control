@@ -1,21 +1,21 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #pragma once
 
-#include "td/actor/actor.h"
-#include "td/actor/PromiseFuture.h"
-
-#include "td/telegram/td_api.h"
-
 #include "td/telegram/files/FileType.h"
 #include "td/telegram/net/NetType.h"
+#include "td/telegram/td_api.h"
 
 #include "td/net/NetStats.h"
 
+#include "td/actor/actor.h"
+
+#include "td/utils/common.h"
+#include "td/utils/Promise.h"
 #include "td/utils/Slice.h"
 
 #include <array>
@@ -53,7 +53,7 @@ struct NetworkStats {
     result->since_date_ = since;
     result->entries_.reserve(entries.size());
     for (const auto &entry : entries) {
-      if ((entry.rx != 0 || entry.tx != 0) && entry.file_type != FileType::SecureRaw) {
+      if ((entry.rx != 0 || entry.tx != 0) && entry.file_type != FileType::SecureDecrypted) {
         result->entries_.push_back(entry.get_network_statistics_entry_object());
       }
     }
@@ -61,7 +61,7 @@ struct NetworkStats {
   }
 };
 
-class NetStatsManager : public Actor {
+class NetStatsManager final : public Actor {
  public:
   explicit NetStatsManager(ActorShared<> parent) : parent_(std::move(parent)) {
   }
@@ -128,17 +128,18 @@ class NetStatsManager : public Actor {
     for (int32 file_type_i = 0; file_type_i < MAX_FILE_TYPE; file_type_i++) {
       auto &stat = files_stats_[file_type_i];
       auto file_type = static_cast<FileType>(file_type_i);
-      f(stat, file_type_i + 2, get_file_type_name(file_type), file_type);
+      f(stat, file_type_i + 2, get_file_type_unique_name(file_type), file_type);
     }
     f(call_net_stats_, CALL_NET_STATS_ID, CSlice("calls"), FileType::None);
   }
 
-  void add_network_stats_impl(NetStatsInfo &info, const NetworkStatsEntry &entry);
+  static void add_network_stats_impl(NetStatsInfo &info, const NetworkStatsEntry &entry);
 
-  void start_up() override;
-  void update(NetStatsInfo &info, bool force_save);
-  void save_stats(NetStatsInfo &info, NetType net_type);
-  void info_loop(NetStatsInfo &info);
+  void start_up() final;
+
+  static void update(NetStatsInfo &info, bool force_save);
+  static void save_stats(NetStatsInfo &info, NetType net_type);
+  static void info_loop(NetStatsInfo &info);
 
   void on_stats_updated(size_t id);
   void on_net_type_updated(NetType net_type);

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -7,10 +7,13 @@
 #include "td/telegram/ConfigManager.h"
 
 #include "td/telegram/AuthManager.h"
-#include "td/telegram/ConfigShared.h"
+#include "td/telegram/ConnectionState.h"
+#include "td/telegram/ContactsManager.h"
 #include "td/telegram/Global.h"
 #include "td/telegram/JsonValue.h"
+#include "td/telegram/LinkManager.h"
 #include "td/telegram/logevent/LogEvent.h"
+#include "td/telegram/misc.h"
 #include "td/telegram/net/AuthDataShared.h"
 #include "td/telegram/net/ConnectionCreator.h"
 #include "td/telegram/net/DcId.h"
@@ -18,12 +21,16 @@
 #include "td/telegram/net/NetQuery.h"
 #include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/net/NetType.h"
-#include "td/telegram/net/PublicRsaKeyShared.h"
+#include "td/telegram/net/PublicRsaKeySharedMain.h"
 #include "td/telegram/net/Session.h"
+#include "td/telegram/OptionManager.h"
+#include "td/telegram/Premium.h"
+#include "td/telegram/ReactionType.h"
 #include "td/telegram/StateManager.h"
 #include "td/telegram/Td.h"
 #include "td/telegram/TdDb.h"
 #include "td/telegram/telegram_api.h"
+#include "td/telegram/TranscriptionManager.h"
 
 #include "td/mtproto/AuthData.h"
 #include "td/mtproto/AuthKey.h"
@@ -31,18 +38,22 @@
 #include "td/mtproto/RSA.h"
 #include "td/mtproto/TransportType.h"
 
-#include "td/net/HttpQuery.h"
 #if !TD_EMSCRIPTEN  //FIXME
-#include "td/net/SslStream.h"
+#include "td/net/SslCtx.h"
 #include "td/net/Wget.h"
 #endif
 
+#include "td/net/HttpQuery.h"
+
 #include "td/actor/actor.h"
 
+#include "td/utils/algorithm.h"
 #include "td/utils/base64.h"
 #include "td/utils/buffer.h"
 #include "td/utils/common.h"
 #include "td/utils/crypto.h"
+#include "td/utils/emoji.h"
+#include "td/utils/FlatHashMap.h"
 #include "td/utils/format.h"
 #include "td/utils/JsonBuilder.h"
 #include "td/utils/logging.h"
@@ -50,6 +61,7 @@
 #include "td/utils/Parser.h"
 #include "td/utils/port/Clocks.h"
 #include "td/utils/Random.h"
+#include "td/utils/SliceBuilder.h"
 #include "td/utils/Time.h"
 #include "td/utils/tl_helpers.h"
 #include "td/utils/tl_parsers.h"
@@ -58,7 +70,6 @@
 #include <algorithm>
 #include <functional>
 #include <memory>
-#include <unordered_map>
 #include <utility>
 
 namespace td {
@@ -99,7 +110,7 @@ Result<int32> HttpDate::to_unix_time(int32 year, int32 month, int32 day, int32 h
   return res;
 }
 
-Result<int32> HttpDate::parse_http_date(std::string slice) {
+Result<int32> HttpDate::parse_http_date(string slice) {
   Parser p(slice);
   p.read_till(',');  // ignore week day
   p.skip(',');
@@ -143,7 +154,7 @@ Result<int32> HttpDate::parse_http_date(std::string slice) {
 }
 
 Result<SimpleConfig> decode_config(Slice input) {
-  static auto rsa = RSA::from_pem_public_key(
+  static auto rsa = mtproto::RSA::from_pem_public_key(
                         "-----BEGIN RSA PUBLIC KEY-----\n"
                         "MIIBCgKCAQEAyr+18Rex2ohtVy8sroGP\n"
                         "BwXD3DOoKCSpjDqYoXgCqB7ioln4eDCFfOBUlfXUEvM/fnKCpF46VkAftlb4VuPD\n"
@@ -174,9 +185,9 @@ Result<SimpleConfig> decode_config(Slice input) {
   MutableSlice data_cbc = data_rsa_slice.substr(32);
   UInt256 key;
   UInt128 iv;
-  as_slice(key).copy_from(data_rsa_slice.substr(0, 32));
-  as_slice(iv).copy_from(data_rsa_slice.substr(16, 16));
-  aes_cbc_decrypt(as_slice(key), as_slice(iv), data_cbc, data_cbc);
+  as_mutable_slice(key).copy_from(data_rsa_slice.substr(0, 32));
+  as_mutable_slice(iv).copy_from(data_rsa_slice.substr(16, 16));
+  aes_cbc_decrypt(as_slice(key), as_mutable_slice(iv), data_cbc, data_cbc);
 
   CHECK(data_cbc.size() == 224);
   string hash(32, ' ');
@@ -233,72 +244,82 @@ static ActorOwn<> get_simple_config_impl(Promise<SimpleConfigResult> promise, in
           return std::move(res);
         }());
       }),
-      std::move(url), std::move(headers), timeout, ttl, prefer_ipv6, SslStream::VerifyPeer::Off, std::move(content),
+      std::move(url), std::move(headers), timeout, ttl, prefer_ipv6, SslCtx::VerifyPeer::Off, std::move(content),
       std::move(content_type)));
 #endif
 }
 
-ActorOwn<> get_simple_config_azure(Promise<SimpleConfigResult> promise, const ConfigShared *shared_config, bool is_test,
-                                   int32 scheduler_id) {
+ActorOwn<> get_simple_config_azure(Promise<SimpleConfigResult> promise, bool prefer_ipv6, Slice domain_name,
+                                   bool is_test, int32 scheduler_id) {
   string url = PSTRING() << "https://software-download.microsoft.com/" << (is_test ? "test" : "prod")
                          << "v2/config.txt";
-  const bool prefer_ipv6 = shared_config == nullptr ? false : shared_config->get_option_boolean("prefer_ipv6");
   return get_simple_config_impl(std::move(promise), scheduler_id, std::move(url), "tcdnb.azureedge.net", {},
                                 prefer_ipv6,
                                 [](HttpQuery &http_query) -> Result<string> { return http_query.content_.str(); });
 }
 
 static ActorOwn<> get_simple_config_dns(Slice address, Slice host, Promise<SimpleConfigResult> promise,
-                                        const ConfigShared *shared_config, bool is_test, int32 scheduler_id) {
-  string name = shared_config == nullptr ? string() : shared_config->get_option_string("dc_txt_domain_name");
-  const bool prefer_ipv6 = shared_config == nullptr ? false : shared_config->get_option_boolean("prefer_ipv6");
-  if (name.empty()) {
-    name = is_test ? "tapv3.stel.com" : "apv3.stel.com";
+                                        bool prefer_ipv6, Slice domain_name, bool is_test, int32 scheduler_id) {
+  if (domain_name.empty()) {
+    domain_name = is_test ? Slice("tapv3.stel.com") : Slice("apv3.stel.com");
   }
   auto get_config = [](HttpQuery &http_query) -> Result<string> {
-    VLOG(config_recoverer) << "Receive DNS response " << http_query.content_;
-    TRY_RESULT(json, json_decode(http_query.content_));
-    if (json.type() != JsonValue::Type::Object) {
-      return Status::Error("Expected JSON object");
-    }
-    auto &answer_object = json.get_object();
-    TRY_RESULT(answer, get_json_object_field(answer_object, "Answer", JsonValue::Type::Array, false));
-    auto &answer_array = answer.get_array();
-    vector<string> parts;
-    for (auto &answer_part : answer_array) {
-      if (answer_part.type() != JsonValue::Type::Object) {
+    auto get_data = [](JsonValue &answer) -> Result<string> {
+      auto &answer_array = answer.get_array();
+      vector<string> parts;
+      for (auto &answer_part : answer_array) {
+        if (answer_part.type() != JsonValue::Type::Object) {
+          return Status::Error("Expected JSON object");
+        }
+        auto &data_object = answer_part.get_object();
+        TRY_RESULT(part, data_object.get_required_string_field("data"));
+        parts.push_back(std::move(part));
+      }
+      if (parts.size() != 2) {
+        return Status::Error("Expected data in two parts");
+      }
+      string data;
+      if (parts[0].size() < parts[1].size()) {
+        data = parts[1] + parts[0];
+      } else {
+        data = parts[0] + parts[1];
+      }
+      return data;
+    };
+    if (!http_query.get_arg("Answer").empty()) {
+      VLOG(config_recoverer) << "Receive DNS response " << http_query.get_arg("Answer");
+      TRY_RESULT(answer, json_decode(http_query.get_arg("Answer")));
+      if (answer.type() != JsonValue::Type::Array) {
+        return Status::Error("Expected JSON array");
+      }
+      return get_data(answer);
+    } else {
+      VLOG(config_recoverer) << "Receive DNS response " << http_query.content_;
+      TRY_RESULT(json, json_decode(http_query.content_));
+      if (json.type() != JsonValue::Type::Object) {
         return Status::Error("Expected JSON object");
       }
-      auto &data_object = answer_part.get_object();
-      TRY_RESULT(part, get_json_object_string_field(data_object, "data", false));
-      parts.push_back(std::move(part));
+      auto &answer_object = json.get_object();
+      TRY_RESULT(answer, answer_object.extract_required_field("Answer", JsonValue::Type::Array));
+      return get_data(answer);
     }
-    if (parts.size() != 2) {
-      return Status::Error("Expected data in two parts");
-    }
-    string data;
-    if (parts[0].size() < parts[1].size()) {
-      data = parts[1] + parts[0];
-    } else {
-      data = parts[0] + parts[1];
-    }
-    return data;
   };
-  return get_simple_config_impl(std::move(promise), scheduler_id,
-                                PSTRING() << "https://" << address << "?name=" << url_encode(name) << "&type=TXT",
-                                host.str(), {{"Accept", "application/dns-json"}}, prefer_ipv6, std::move(get_config));
+  return get_simple_config_impl(
+      std::move(promise), scheduler_id,
+      PSTRING() << "https://" << address << "?name=" << url_encode(domain_name) << "&type=TXT", host.str(),
+      {{"Accept", "application/dns-json"}}, prefer_ipv6, std::move(get_config));
 }
 
-ActorOwn<> get_simple_config_google_dns(Promise<SimpleConfigResult> promise, const ConfigShared *shared_config,
+ActorOwn<> get_simple_config_google_dns(Promise<SimpleConfigResult> promise, bool prefer_ipv6, Slice domain_name,
                                         bool is_test, int32 scheduler_id) {
-  return get_simple_config_dns("dns.google/resolve", "dns.google", std::move(promise), shared_config, is_test,
-                               scheduler_id);
+  return get_simple_config_dns("dns.google/resolve", "dns.google", std::move(promise), prefer_ipv6, domain_name,
+                               is_test, scheduler_id);
 }
 
-ActorOwn<> get_simple_config_mozilla_dns(Promise<SimpleConfigResult> promise, const ConfigShared *shared_config,
+ActorOwn<> get_simple_config_mozilla_dns(Promise<SimpleConfigResult> promise, bool prefer_ipv6, Slice domain_name,
                                          bool is_test, int32 scheduler_id) {
   return get_simple_config_dns("mozilla.cloudflare-dns.com/dns-query", "mozilla.cloudflare-dns.com", std::move(promise),
-                               shared_config, is_test, scheduler_id);
+                               prefer_ipv6, domain_name, is_test, scheduler_id);
 }
 
 static string generate_firebase_remote_config_payload() {
@@ -311,9 +332,8 @@ static string generate_firebase_remote_config_payload() {
                    << app_instance_id << "\"}";
 }
 
-ActorOwn<> get_simple_config_firebase_remote_config(Promise<SimpleConfigResult> promise,
-                                                    const ConfigShared *shared_config, bool is_test,
-                                                    int32 scheduler_id) {
+ActorOwn<> get_simple_config_firebase_remote_config(Promise<SimpleConfigResult> promise, bool prefer_ipv6,
+                                                    Slice domain_name, bool is_test, int32 scheduler_id) {
   if (is_test) {
     promise.set_error(Status::Error(400, "Test config is not supported"));
     return ActorOwn<>();
@@ -323,21 +343,20 @@ ActorOwn<> get_simple_config_firebase_remote_config(Promise<SimpleConfigResult> 
   string url =
       "https://firebaseremoteconfig.googleapis.com/v1/projects/peak-vista-421/namespaces/"
       "firebase:fetch?key=AIzaSyC2-kAkpDsroixRXw-sTw-Wfqo4NxjMwwM";
-  const bool prefer_ipv6 = shared_config == nullptr ? false : shared_config->get_option_boolean("prefer_ipv6");
   auto get_config = [](HttpQuery &http_query) -> Result<string> {
     TRY_RESULT(json, json_decode(http_query.get_arg("entries")));
     if (json.type() != JsonValue::Type::Object) {
       return Status::Error("Expected JSON object");
     }
     auto &entries_object = json.get_object();
-    TRY_RESULT(config, get_json_object_string_field(entries_object, "ipconfigv3", false));
+    TRY_RESULT(config, entries_object.get_required_string_field("ipconfigv3"));
     return std::move(config);
   };
   return get_simple_config_impl(std::move(promise), scheduler_id, std::move(url), "firebaseremoteconfig.googleapis.com",
                                 {}, prefer_ipv6, std::move(get_config), payload, "application/json");
 }
 
-ActorOwn<> get_simple_config_firebase_realtime(Promise<SimpleConfigResult> promise, const ConfigShared *shared_config,
+ActorOwn<> get_simple_config_firebase_realtime(Promise<SimpleConfigResult> promise, bool prefer_ipv6, Slice domain_name,
                                                bool is_test, int32 scheduler_id) {
   if (is_test) {
     promise.set_error(Status::Error(400, "Test config is not supported"));
@@ -345,7 +364,6 @@ ActorOwn<> get_simple_config_firebase_realtime(Promise<SimpleConfigResult> promi
   }
 
   string url = "https://reserve-5a846.firebaseio.com/ipconfigv3.json";
-  const bool prefer_ipv6 = shared_config == nullptr ? false : shared_config->get_option_boolean("prefer_ipv6");
   auto get_config = [](HttpQuery &http_query) -> Result<string> {
     return http_query.get_arg("content").str();
   };
@@ -353,30 +371,32 @@ ActorOwn<> get_simple_config_firebase_realtime(Promise<SimpleConfigResult> promi
                                 prefer_ipv6, std::move(get_config));
 }
 
-ActorOwn<> get_simple_config_firebase_firestore(Promise<SimpleConfigResult> promise, const ConfigShared *shared_config,
-                                                bool is_test, int32 scheduler_id) {
+ActorOwn<> get_simple_config_firebase_firestore(Promise<SimpleConfigResult> promise, bool prefer_ipv6,
+                                                Slice domain_name, bool is_test, int32 scheduler_id) {
   if (is_test) {
     promise.set_error(Status::Error(400, "Test config is not supported"));
     return ActorOwn<>();
   }
 
   string url = "https://www.google.com/v1/projects/reserve-5a846/databases/(default)/documents/ipconfig/v3";
-  const bool prefer_ipv6 = shared_config == nullptr ? false : shared_config->get_option_boolean("prefer_ipv6");
   auto get_config = [](HttpQuery &http_query) -> Result<string> {
     TRY_RESULT(json, json_decode(http_query.get_arg("fields")));
     if (json.type() != JsonValue::Type::Object) {
       return Status::Error("Expected JSON object");
     }
-    TRY_RESULT(data, get_json_object_field(json.get_object(), "data", JsonValue::Type::Object, false));
-    TRY_RESULT(config, get_json_object_string_field(data.get_object(), "stringValue", false));
+    auto &json_object = json.get_object();
+    TRY_RESULT(data, json_object.extract_required_field("data", JsonValue::Type::Object));
+    auto &data_object = data.get_object();
+    TRY_RESULT(config, data_object.get_required_string_field("stringValue"));
     return std::move(config);
   };
   return get_simple_config_impl(std::move(promise), scheduler_id, std::move(url), "firestore.googleapis.com", {},
                                 prefer_ipv6, std::move(get_config));
 }
 
-ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorShared<> parent) {
-  class SessionCallback : public Session::Callback {
+static ActorOwn<> get_full_config(DcOption option, Promise<tl_object_ptr<telegram_api::config>> promise,
+                                  ActorShared<> parent) {
+  class SessionCallback final : public Session::Callback {
    public:
     SessionCallback(ActorShared<> parent, DcOption option) : parent_(std::move(parent)), option_(std::move(option)) {
     }
@@ -403,6 +423,12 @@ ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorSh
     void on_tmp_auth_key_updated(mtproto::AuthKey auth_key) final {
       // nop
     }
+    void on_server_salt_updated(std::vector<mtproto::ServerSalt> server_salts) final {
+      // nop
+    }
+    void on_update(BufferSlice &&update, uint64 auth_key_id) final {
+      // nop
+    }
     void on_result(NetQueryPtr net_query) final {
       G()->net_query_dispatcher().dispatch(std::move(net_query));
     }
@@ -414,17 +440,18 @@ ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorSh
     std::vector<Promise<unique_ptr<mtproto::RawConnection>>> delay_forever_;
   };
 
-  class SimpleAuthData : public AuthDataShared {
+  class SimpleAuthData final : public AuthDataShared {
    public:
-    explicit SimpleAuthData(DcId dc_id) : dc_id_(dc_id) {
+    explicit SimpleAuthData(DcId dc_id)
+        : dc_id_(dc_id), public_rsa_key_(PublicRsaKeySharedMain::create(G()->is_test_dc())) {
     }
-    DcId dc_id() const override {
+    DcId dc_id() const final {
       return dc_id_;
     }
-    const std::shared_ptr<PublicRsaKeyShared> &public_rsa_key() override {
+    const std::shared_ptr<mtproto::PublicRsaKeyInterface> &public_rsa_key() final {
       return public_rsa_key_;
     }
-    mtproto::AuthKey get_auth_key() override {
+    mtproto::AuthKey get_auth_key() final {
       string dc_key = G()->td_db()->get_binlog_pmc()->get(auth_key_key());
 
       mtproto::AuthKey res;
@@ -433,33 +460,29 @@ ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorSh
       }
       return res;
     }
-    std::pair<AuthKeyState, bool> get_auth_key_state() override {
-      auto auth_key = get_auth_key();
-      AuthKeyState state = AuthDataShared::get_auth_key_state(auth_key);
-      return std::make_pair(state, auth_key.was_auth_flag());
-    }
-    void set_auth_key(const mtproto::AuthKey &auth_key) override {
+    void set_auth_key(const mtproto::AuthKey &auth_key) final {
       G()->td_db()->get_binlog_pmc()->set(auth_key_key(), serialize(auth_key));
 
       //notify();
     }
-    void update_server_time_difference(double diff) override {
-      G()->update_server_time_difference(diff);
+    void update_server_time_difference(double diff, bool force) final {
+      G()->update_server_time_difference(diff, force);
     }
-    double get_server_time_difference() override {
+    double get_server_time_difference() final {
       return G()->get_server_time_difference();
     }
-    void add_auth_key_listener(unique_ptr<Listener> listener) override {
+    void add_auth_key_listener(unique_ptr<Listener> listener) final {
+      CHECK(listener != nullptr);
       if (listener->notify()) {
         auth_key_listeners_.push_back(std::move(listener));
       }
     }
 
-    void set_future_salts(const std::vector<mtproto::ServerSalt> &future_salts) override {
+    void set_future_salts(const std::vector<mtproto::ServerSalt> &future_salts) final {
       G()->td_db()->get_binlog_pmc()->set(future_salts_key(), serialize(future_salts));
     }
 
-    std::vector<mtproto::ServerSalt> get_future_salts() override {
+    std::vector<mtproto::ServerSalt> get_future_salts() final {
       string future_salts = G()->td_db()->get_binlog_pmc()->get(future_salts_key());
       std::vector<mtproto::ServerSalt> res;
       if (!future_salts.empty()) {
@@ -470,30 +493,33 @@ ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorSh
 
    private:
     DcId dc_id_;
-    std::shared_ptr<PublicRsaKeyShared> public_rsa_key_ =
-        std::make_shared<PublicRsaKeyShared>(DcId::empty(), G()->is_test_dc());
+    std::shared_ptr<mtproto::PublicRsaKeyInterface> public_rsa_key_;
+    vector<unique_ptr<Listener>> auth_key_listeners_;
 
-    std::vector<unique_ptr<Listener>> auth_key_listeners_;
     void notify() {
-      td::remove_if(auth_key_listeners_, [&](auto &listener) { return !listener->notify(); });
+      td::remove_if(auth_key_listeners_, [&](auto &listener) {
+        CHECK(listener != nullptr);
+        return !listener->notify();
+      });
     }
 
     string auth_key_key() const {
       return PSTRING() << "config_recovery_auth" << dc_id().get_raw_id();
     }
+
     string future_salts_key() const {
       return PSTRING() << "config_recovery_salt" << dc_id().get_raw_id();
     }
   };
 
-  class GetConfigActor : public NetQueryCallback {
+  class GetConfigActor final : public NetQueryCallback {
    public:
-    GetConfigActor(DcOption option, Promise<FullConfig> promise, ActorShared<> parent)
+    GetConfigActor(DcOption option, Promise<tl_object_ptr<telegram_api::config>> promise, ActorShared<> parent)
         : option_(std::move(option)), promise_(std::move(promise)), parent_(std::move(parent)) {
     }
 
    private:
-    void start_up() override {
+    void start_up() final {
       auto auth_data = std::make_shared<SimpleAuthData>(option_.get_dc_id());
       int32 raw_dc_id = option_.get_dc_id().get_raw_id();
       auto session_callback = make_unique<SessionCallback>(actor_shared(this, 1), std::move(option_));
@@ -502,10 +528,10 @@ ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorSh
       if (G()->is_test_dc()) {
         int_dc_id += 10000;
       }
-      session_ = create_actor<Session>("ConfigSession", std::move(session_callback), std::move(auth_data), raw_dc_id,
-                                       int_dc_id, false /*is_main*/, true /*use_pfs*/, false /*is_cdn*/,
-                                       false /*need_destroy_auth_key*/, mtproto::AuthKey(),
-                                       std::vector<mtproto::ServerSalt>());
+      session_ = create_actor<Session>(
+          "ConfigSession", std::move(session_callback), std::move(auth_data), raw_dc_id, int_dc_id,
+          false /*is_primary*/, false /*is_main*/, true /*use_pfs*/, false /*persist_tmp_auth_key*/, false /*is_cdn*/,
+          false /*need_destroy_auth_key*/, mtproto::AuthKey(), std::vector<mtproto::ServerSalt>());
       auto query = G()->net_query_creator().create_unauth(telegram_api::help_getConfig(), DcId::empty());
       query->total_timeout_limit_ = 60 * 60 * 24;
       query->set_callback(actor_shared(this));
@@ -513,10 +539,10 @@ ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorSh
       send_closure(session_, &Session::send, std::move(query));
       set_timeout_in(10);
     }
-    void on_result(NetQueryPtr query) override {
+    void on_result(NetQueryPtr query) final {
       promise_.set_result(fetch_result<telegram_api::help_getConfig>(std::move(query)));
     }
-    void hangup_shared() override {
+    void hangup_shared() final {
       if (get_link_token() == 1) {
         if (promise_) {
           promise_.set_error(Status::Error("Failed"));
@@ -524,31 +550,32 @@ ActorOwn<> get_full_config(DcOption option, Promise<FullConfig> promise, ActorSh
         stop();
       }
     }
-    void hangup() override {
+    void hangup() final {
       session_.reset();
     }
-    void timeout_expired() override {
+    void timeout_expired() final {
       promise_.set_error(Status::Error("Timeout expired"));
       session_.reset();
     }
 
     DcOption option_;
     ActorOwn<Session> session_;
-    Promise<FullConfig> promise_;
+    Promise<tl_object_ptr<telegram_api::config>> promise_;
     ActorShared<> parent_;
   };
 
-  return ActorOwn<>(create_actor<GetConfigActor>("GetConfigActor", option, std::move(promise), std::move(parent)));
+  return ActorOwn<>(
+      create_actor<GetConfigActor>("GetConfigActor", std::move(option), std::move(promise), std::move(parent)));
 }
 
-class ConfigRecoverer : public Actor {
+class ConfigRecoverer final : public Actor {
  public:
   explicit ConfigRecoverer(ActorShared<> parent) : parent_(std::move(parent)) {
     connecting_since_ = Time::now();
   }
 
   void on_dc_options_update(DcOptions dc_options) {
-    dc_options_update_ = dc_options;
+    dc_options_update_ = std::move(dc_options);
     update_dc_options();
     loop();
   }
@@ -637,7 +664,7 @@ class ConfigRecoverer : public Actor {
       auto config = r_simple_config.move_as_ok();
       VLOG(config_recoverer) << "Receive raw " << to_string(config);
       if (config->expires_ >= G()->unix_time()) {
-        string phone_number = G()->shared_config().get_option_string("my_phone_number");
+        string phone_number = G()->get_option_string("my_phone_number");
         simple_config_.dc_options.clear();
 
         for (auto &rule : config->rules_) {
@@ -651,7 +678,7 @@ class ConfigRecoverer : public Actor {
             }
           }
         }
-        VLOG(config_recoverer) << "Got SimpleConfig " << simple_config_;
+        VLOG(config_recoverer) << "Receive SimpleConfig " << simple_config_;
       } else {
         VLOG(config_recoverer) << "Config has expired at " << config->expires_;
       }
@@ -668,23 +695,23 @@ class ConfigRecoverer : public Actor {
     }
   }
 
-  void on_full_config(Result<FullConfig> r_full_config, bool dummy) {
+  void on_full_config(Result<tl_object_ptr<telegram_api::config>> r_full_config, bool dummy) {
     full_config_query_.reset();
     if (r_full_config.is_ok()) {
       full_config_ = r_full_config.move_as_ok();
-      VLOG(config_recoverer) << "Got FullConfig " << to_string(full_config_);
+      VLOG(config_recoverer) << "Receive " << to_string(full_config_);
       full_config_expires_at_ = get_config_expire_time();
       send_closure(G()->connection_creator(), &ConnectionCreator::on_dc_options, DcOptions(full_config_->dc_options_));
     } else {
-      VLOG(config_recoverer) << "Get FullConfig error " << r_full_config.error();
-      full_config_ = FullConfig();
+      VLOG(config_recoverer) << "Failed to get config: " << r_full_config.error();
+      full_config_ = nullptr;
       full_config_expires_at_ = get_failed_config_expire_time();
     }
     loop();
   }
 
-  bool expect_blocking() const {
-    return G()->shared_config().get_option_boolean("expect_blocking", true);
+  static bool expect_blocking() {
+    return G()->get_option_boolean("expect_blocking", true);
   }
 
   double get_config_expire_time() const {
@@ -717,11 +744,11 @@ class ConfigRecoverer : public Actor {
 
   DcOptions dc_options_;  // dc_options_update_ + simple_config_
   double dc_options_at_{0};
-  size_t dc_options_i_;
+  size_t dc_options_i_{0};
 
   size_t date_option_i_{0};
 
-  FullConfig full_config_;
+  tl_object_ptr<telegram_api::config> full_config_;
   double full_config_expires_at_{0};
   ActorOwn<> full_config_query_;
 
@@ -731,11 +758,11 @@ class ConfigRecoverer : public Actor {
 
   ActorShared<> parent_;
 
-  void hangup_shared() override {
+  void hangup_shared() final {
     ref_cnt_--;
     try_stop();
   }
-  void hangup() override {
+  void hangup() final {
     ref_cnt_--;
     close_flag_ = true;
     full_config_query_.reset();
@@ -752,15 +779,21 @@ class ConfigRecoverer : public Actor {
   double max_connecting_delay() const {
     return expect_blocking() ? 5 : 20;
   }
-  void loop() override {
+
+  void loop() final {
     if (close_flag_) {
+      return;
+    }
+    if (Session::is_high_loaded()) {
+      VLOG(config_recoverer) << "Skip config recoverer under high load";
+      set_timeout_in(Random::fast(200, 300));
       return;
     }
 
     if (is_connecting_) {
-      VLOG(config_recoverer) << "Failed to connect for " << Time::now() - connecting_since_;
+      VLOG(config_recoverer) << "Failed to connect for " << Time::now() - connecting_since_ << " seconds";
     } else {
-      VLOG(config_recoverer) << "Successfully connected in " << Time::now() - connecting_since_;
+      VLOG(config_recoverer) << "Successfully connected in " << Time::now() - connecting_since_ << " seconds";
     }
 
     Timestamp wakeup_timestamp;
@@ -788,10 +821,9 @@ class ConfigRecoverer : public Actor {
     if (need_simple_config) {
       ref_cnt_++;
       VLOG(config_recoverer) << "Ask simple config with turn " << simple_config_turn_;
-      auto promise =
-          PromiseCreator::lambda([actor_id = actor_shared(this)](Result<SimpleConfigResult> r_simple_config) {
-            send_closure(actor_id, &ConfigRecoverer::on_simple_config, std::move(r_simple_config), false);
-          });
+      auto promise = PromiseCreator::lambda([self = actor_shared(this)](Result<SimpleConfigResult> r_simple_config) {
+        send_closure(self, &ConfigRecoverer::on_simple_config, std::move(r_simple_config), false);
+      });
       auto get_simple_config = [&] {
         switch (simple_config_turn_ % 10) {
           case 6:
@@ -799,9 +831,9 @@ class ConfigRecoverer : public Actor {
           case 2:
             return get_simple_config_firebase_remote_config;
           case 4:
-            return get_simple_config_firebase_realtime;
-          case 9:
             return get_simple_config_firebase_firestore;
+          case 9:
+            return get_simple_config_firebase_realtime;
           case 0:
           case 3:
           case 8:
@@ -813,20 +845,22 @@ class ConfigRecoverer : public Actor {
             return get_simple_config_mozilla_dns;
         }
       }();
-      simple_config_query_ =
-          get_simple_config(std::move(promise), &G()->shared_config(), G()->is_test_dc(), G()->get_gc_scheduler_id());
+      simple_config_query_ = get_simple_config(std::move(promise), G()->get_option_boolean("prefer_ipv6"),
+                                               G()->get_option_string("dc_txt_domain_name"), G()->is_test_dc(),
+                                               G()->get_gc_scheduler_id());
       simple_config_turn_++;
     }
 
     if (need_full_config) {
       ref_cnt_++;
       VLOG(config_recoverer) << "Ask full config with dc_options_i_ = " << dc_options_i_;
-      full_config_query_ =
-          get_full_config(dc_options_.dc_options[dc_options_i_],
-                          PromiseCreator::lambda([actor_id = actor_id(this)](Result<FullConfig> r_full_config) {
-                            send_closure(actor_id, &ConfigRecoverer::on_full_config, std::move(r_full_config), false);
-                          }),
-                          actor_shared(this));
+      full_config_query_ = get_full_config(
+          dc_options_.dc_options[dc_options_i_],
+          PromiseCreator::lambda(
+              [actor_id = actor_id(this)](Result<tl_object_ptr<telegram_api::config>> r_full_config) {
+                send_closure(actor_id, &ConfigRecoverer::on_full_config, std::move(r_full_config), false);
+              }),
+          actor_shared(this));
       dc_options_i_ = (dc_options_i_ + 1) % dc_options_.dc_options.size();
     }
 
@@ -838,20 +872,20 @@ class ConfigRecoverer : public Actor {
     }
   }
 
-  void start_up() override {
-    class StateCallback : public StateManager::Callback {
+  void start_up() final {
+    class StateCallback final : public StateManager::Callback {
      public:
       explicit StateCallback(ActorId<ConfigRecoverer> parent) : parent_(std::move(parent)) {
       }
-      bool on_state(StateManager::State state) override {
-        send_closure(parent_, &ConfigRecoverer::on_connecting, state == StateManager::State::Connecting);
+      bool on_state(ConnectionState state) final {
+        send_closure(parent_, &ConfigRecoverer::on_connecting, state == ConnectionState::Connecting);
         return parent_.is_alive();
       }
-      bool on_network(NetType network_type, uint32 network_generation) override {
+      bool on_network(NetType network_type, uint32 network_generation) final {
         send_closure(parent_, &ConfigRecoverer::on_network, network_type != NetType::None, network_generation);
         return parent_.is_alive();
       }
-      bool on_online(bool online_flag) override {
+      bool on_online(bool online_flag) final {
         send_closure(parent_, &ConfigRecoverer::on_online, online_flag);
         return parent_.is_alive();
       }
@@ -874,8 +908,35 @@ class ConfigRecoverer : public Actor {
   }
 };
 
+template <class StorerT>
+void ConfigManager::AppConfig::store(StorerT &storer) const {
+  td::store(version_, storer);
+  td::store(hash_, storer);
+  config_->store(storer);
+}
+
+template <class ParserT>
+void ConfigManager::AppConfig::parse(ParserT &parser) {
+  td::parse(version_, parser);
+  if (version_ != CURRENT_VERSION) {
+    return parser.set_error("Invalid config version");
+  }
+  td::parse(hash_, parser);
+  auto buffer = parser.template fetch_string_raw<BufferSlice>(parser.get_left_len());
+  TlBufferParser buffer_parser{&buffer};
+  config_ = telegram_api::jsonObject::fetch(buffer_parser);
+  buffer_parser.fetch_end();
+  if (buffer_parser.get_error() != nullptr) {
+    return parser.set_error(buffer_parser.get_error());
+  }
+}
+
 ConfigManager::ConfigManager(ActorShared<> parent) : parent_(std::move(parent)) {
   lazy_request_flood_control_.add_limit(20, 1);
+
+  if (log_event_parse(app_config_, G()->td_db()->get_binlog_pmc()->get("app_config")).is_error()) {
+    app_config_ = AppConfig();
+  }
 }
 
 void ConfigManager::start_up() {
@@ -883,8 +944,10 @@ void ConfigManager::start_up() {
   send_closure(config_recoverer_, &ConfigRecoverer::on_dc_options_update, load_dc_options_update());
 
   auto expire_time = load_config_expire_time();
-  if (expire_time.is_in_past() || true) {
-    request_config();
+  auto auth_manager = G()->td().get_actor_unsafe()->auth_manager_.get();
+  bool reload_config_on_restart = auth_manager == nullptr || !auth_manager->is_bot();
+  if (expire_time.is_in_past() || reload_config_on_restart) {
+    request_config(false);
   } else {
     expire_time_ = expire_time;
     set_timeout_in(expire_time_.in());
@@ -897,7 +960,8 @@ ActorShared<> ConfigManager::create_reference() {
 }
 
 void ConfigManager::hangup_shared() {
-  LOG_CHECK(get_link_token() == REFCNT_TOKEN) << "Expected REFCNT_TOKEN, got " << get_link_token();
+  LOG_CHECK(get_link_token() == REFCNT_TOKEN)
+      << "Expected link token " << REFCNT_TOKEN << ", but receive " << get_link_token();
   ref_cnt_--;
   try_stop();
 }
@@ -910,7 +974,7 @@ void ConfigManager::hangup() {
 
 void ConfigManager::loop() {
   if (expire_time_ && expire_time_.is_in_past()) {
-    request_config();
+    request_config(reopen_sessions_after_get_config_);
     expire_time_ = {};
   }
 }
@@ -921,17 +985,17 @@ void ConfigManager::try_stop() {
   }
 }
 
-void ConfigManager::request_config() {
+void ConfigManager::request_config(bool reopen_sessions) {
   if (G()->close_flag()) {
     return;
   }
 
-  if (config_sent_cnt_ != 0) {
+  if (config_sent_cnt_ != 0 && !reopen_sessions) {
     return;
   }
 
-  lazy_request_flood_control_.add_event(static_cast<int32>(Timestamp::now().at()));
-  request_config_from_dc_impl(DcId::main());
+  lazy_request_flood_control_.add_event(Time::now());
+  request_config_from_dc_impl(DcId::main(), reopen_sessions);
 }
 
 void ConfigManager::lazy_request_config() {
@@ -947,10 +1011,29 @@ void ConfigManager::lazy_request_config() {
   set_timeout_at(expire_time_.at());
 }
 
-void ConfigManager::get_app_config(Promise<td_api::object_ptr<td_api::JsonValue>> &&promise) {
-  if (G()->close_flag()) {
-    return promise.set_error(Status::Error(500, "Request aborted"));
+void ConfigManager::reget_config(Promise<Unit> &&promise) {
+  TRY_STATUS_PROMISE(promise, G()->close_status());
+
+  reget_config_queries_.push_back(std::move(promise));
+  if (reget_config_queries_.size() != 1) {
+    return;
   }
+
+  request_config_from_dc_impl(DcId::main(), false);
+}
+
+void ConfigManager::try_request_app_config() {
+  if (get_app_config_queries_.size() + reget_app_config_queries_.size() != 1) {
+    return;
+  }
+
+  auto query = G()->net_query_creator().create_unauth(telegram_api::help_getAppConfig(app_config_.hash_));
+  query->total_timeout_limit_ = 60 * 60 * 24;
+  G()->net_query_dispatcher().dispatch_with_callback(std::move(query), actor_shared(this, 1));
+}
+
+void ConfigManager::get_app_config(Promise<td_api::object_ptr<td_api::JsonValue>> &&promise) {
+  TRY_STATUS_PROMISE(promise, G()->close_status());
 
   auto auth_manager = G()->td().get_actor_unsafe()->auth_manager_.get();
   if (auth_manager != nullptr && auth_manager->is_bot()) {
@@ -958,17 +1041,23 @@ void ConfigManager::get_app_config(Promise<td_api::object_ptr<td_api::JsonValue>
   }
 
   get_app_config_queries_.push_back(std::move(promise));
-  if (get_app_config_queries_.size() == 1) {
-    auto query = G()->net_query_creator().create_unauth(telegram_api::help_getAppConfig());
-    query->total_timeout_limit_ = 60 * 60 * 24;
-    G()->net_query_dispatcher().dispatch_with_callback(std::move(query), actor_shared(this, 1));
+  try_request_app_config();
+}
+
+void ConfigManager::reget_app_config(Promise<Unit> &&promise) {
+  TRY_STATUS_PROMISE(promise, G()->close_status());
+
+  auto auth_manager = G()->td().get_actor_unsafe()->auth_manager_.get();
+  if (auth_manager != nullptr && auth_manager->is_bot()) {
+    return promise.set_value(Unit());
   }
+
+  reget_app_config_queries_.push_back(std::move(promise));
+  try_request_app_config();
 }
 
 void ConfigManager::get_content_settings(Promise<Unit> &&promise) {
-  if (G()->close_flag()) {
-    return promise.set_error(Status::Error(500, "Request aborted"));
-  }
+  TRY_STATUS_PROMISE(promise, G()->close_status());
 
   auto auth_manager = G()->td().get_actor_unsafe()->auth_manager_.get();
   if (auth_manager == nullptr || !auth_manager->is_authorized() || auth_manager->is_bot()) {
@@ -983,9 +1072,7 @@ void ConfigManager::get_content_settings(Promise<Unit> &&promise) {
 }
 
 void ConfigManager::set_content_settings(bool ignore_sensitive_content_restrictions, Promise<Unit> &&promise) {
-  if (G()->close_flag()) {
-    return promise.set_error(Status::Error(500, "Request aborted"));
-  }
+  TRY_STATUS_PROMISE(promise, G()->close_status());
 
   last_set_content_settings_ = ignore_sensitive_content_restrictions;
   auto &queries = set_content_settings_queries_[ignore_sensitive_content_restrictions];
@@ -1002,89 +1089,39 @@ void ConfigManager::set_content_settings(bool ignore_sensitive_content_restricti
   }
 }
 
-void ConfigManager::get_global_privacy_settings(Promise<Unit> &&promise) {
-  if (G()->close_flag()) {
-    return promise.set_error(Status::Error(500, "Request aborted"));
-  }
-
-  auto auth_manager = G()->td().get_actor_unsafe()->auth_manager_.get();
-  if (auth_manager == nullptr || !auth_manager->is_authorized() || auth_manager->is_bot()) {
-    return promise.set_value(Unit());
-  }
-
-  get_global_privacy_settings_queries_.push_back(std::move(promise));
-  if (get_global_privacy_settings_queries_.size() == 1) {
-    G()->net_query_dispatcher().dispatch_with_callback(
-        G()->net_query_creator().create(telegram_api::account_getGlobalPrivacySettings()), actor_shared(this, 5));
-  }
-}
-
-void ConfigManager::set_archive_and_mute(bool archive_and_mute, Promise<Unit> &&promise) {
-  if (G()->close_flag()) {
-    return promise.set_error(Status::Error(500, "Request aborted"));
-  }
-  if (archive_and_mute) {
-    do_dismiss_suggested_action(SuggestedAction::EnableArchiveAndMuteNewChats);
-  }
-
-  last_set_archive_and_mute_ = archive_and_mute;
-  auto &queries = set_archive_and_mute_queries_[archive_and_mute];
-  queries.push_back(std::move(promise));
-  if (!is_set_archive_and_mute_request_sent_) {
-    is_set_archive_and_mute_request_sent_ = true;
-    int32 flags = telegram_api::globalPrivacySettings::ARCHIVE_AND_MUTE_NEW_NONCONTACT_PEERS_MASK;
-    auto settings = make_tl_object<telegram_api::globalPrivacySettings>(flags, archive_and_mute);
-    G()->net_query_dispatcher().dispatch_with_callback(
-        G()->net_query_creator().create(telegram_api::account_setGlobalPrivacySettings(std::move(settings))),
-        actor_shared(this, 6 + static_cast<uint64>(archive_and_mute)));
-  }
-}
-
 void ConfigManager::on_dc_options_update(DcOptions dc_options) {
   save_dc_options_update(dc_options);
-  send_closure(config_recoverer_, &ConfigRecoverer::on_dc_options_update, std::move(dc_options));
-  if (dc_options.dc_options.empty()) {
-    return;
+  if (!dc_options.dc_options.empty()) {
+    expire_time_ = Timestamp::now();
+    save_config_expire(expire_time_);
+    set_timeout_in(expire_time_.in());
   }
-  expire_time_ = Timestamp::now();
-  save_config_expire(expire_time_);
-  set_timeout_in(expire_time_.in());
+  send_closure(config_recoverer_, &ConfigRecoverer::on_dc_options_update, std::move(dc_options));
 }
 
-void ConfigManager::request_config_from_dc_impl(DcId dc_id) {
+void ConfigManager::request_config_from_dc_impl(DcId dc_id, bool reopen_sessions) {
   config_sent_cnt_++;
+  reopen_sessions_after_get_config_ |= reopen_sessions;
   auto query = G()->net_query_creator().create_unauth(telegram_api::help_getConfig(), dc_id);
   query->total_timeout_limit_ = 60 * 60 * 24;
-  G()->net_query_dispatcher().dispatch_with_callback(std::move(query), actor_shared(this, 8));
+  G()->net_query_dispatcher().dispatch_with_callback(std::move(query),
+                                                     actor_shared(this, 8 + static_cast<uint64>(reopen_sessions)));
 }
 
 void ConfigManager::do_set_ignore_sensitive_content_restrictions(bool ignore_sensitive_content_restrictions) {
-  G()->shared_config().set_option_boolean("ignore_sensitive_content_restrictions",
-                                          ignore_sensitive_content_restrictions);
-  bool have_ignored_restriction_reasons = G()->shared_config().have_option("ignored_restriction_reasons");
+  G()->set_option_boolean("ignore_sensitive_content_restrictions", ignore_sensitive_content_restrictions);
+  bool have_ignored_restriction_reasons = G()->have_option("ignored_restriction_reasons");
   if (have_ignored_restriction_reasons != ignore_sensitive_content_restrictions) {
-    get_app_config(Auto());
+    reget_app_config(Auto());
   }
 }
 
-void ConfigManager::do_set_archive_and_mute(bool archive_and_mute) {
-  if (archive_and_mute) {
-    do_dismiss_suggested_action(SuggestedAction::EnableArchiveAndMuteNewChats);
-  }
-  G()->shared_config().set_option_boolean("archive_and_mute_new_chats_from_unknown_users", archive_and_mute);
-}
-
-td_api::object_ptr<td_api::updateSuggestedActions> ConfigManager::get_update_suggested_actions(
-    const vector<SuggestedAction> &added_actions, const vector<SuggestedAction> &removed_actions) {
-  return td_api::make_object<td_api::updateSuggestedActions>(transform(added_actions, get_suggested_action_object),
-                                                             transform(removed_actions, get_suggested_action_object));
+void ConfigManager::hide_suggested_action(SuggestedAction suggested_action) {
+  remove_suggested_action(suggested_actions_, suggested_action);
 }
 
 void ConfigManager::dismiss_suggested_action(SuggestedAction suggested_action, Promise<Unit> &&promise) {
-  if (suggested_action == SuggestedAction::Empty) {
-    return promise.set_error(Status::Error(400, "Action must be non-empty"));
-  }
-  auto action_str = get_suggested_action_str(suggested_action);
+  auto action_str = suggested_action.get_suggested_action_str();
   if (action_str.empty()) {
     return promise.set_value(Unit());
   }
@@ -1094,133 +1131,57 @@ void ConfigManager::dismiss_suggested_action(SuggestedAction suggested_action, P
   }
 
   dismiss_suggested_action_request_count_++;
-  auto &queries = dismiss_suggested_action_queries_[suggested_action];
+  auto type = static_cast<int32>(suggested_action.type_);
+  auto &queries = dismiss_suggested_action_queries_[type];
   queries.push_back(std::move(promise));
   if (queries.size() == 1) {
     G()->net_query_dispatcher().dispatch_with_callback(
-        G()->net_query_creator().create(telegram_api::help_dismissSuggestion(action_str)),
-        actor_shared(this, 100 + static_cast<int32>(suggested_action)));
+        G()->net_query_creator().create(
+            telegram_api::help_dismissSuggestion(make_tl_object<telegram_api::inputPeerEmpty>(), action_str)),
+        actor_shared(this, 100 + type));
   }
 }
 
-void ConfigManager::do_dismiss_suggested_action(SuggestedAction suggested_action) {
-  if (td::remove(suggested_actions_, suggested_action)) {
-    send_closure(G()->td(), &Td::send_update, get_update_suggested_actions({}, {suggested_action}));
-  }
-}
-
-void ConfigManager::on_result(NetQueryPtr res) {
+void ConfigManager::on_result(NetQueryPtr net_query) {
   auto token = get_link_token();
   if (token >= 100 && token <= 200) {
-    SuggestedAction suggested_action = static_cast<SuggestedAction>(static_cast<int32>(token - 100));
-    auto promises = std::move(dismiss_suggested_action_queries_[suggested_action]);
-    dismiss_suggested_action_queries_.erase(suggested_action);
+    auto type = static_cast<int32>(token - 100);
+    SuggestedAction suggested_action{static_cast<SuggestedAction::Type>(type)};
+    auto promises = std::move(dismiss_suggested_action_queries_[type]);
+    dismiss_suggested_action_queries_.erase(type);
     CHECK(!promises.empty());
     CHECK(dismiss_suggested_action_request_count_ >= promises.size());
     dismiss_suggested_action_request_count_ -= promises.size();
 
-    auto result_ptr = fetch_result<telegram_api::help_dismissSuggestion>(std::move(res));
+    auto result_ptr = fetch_result<telegram_api::help_dismissSuggestion>(std::move(net_query));
     if (result_ptr.is_error()) {
-      for (auto &promise : promises) {
-        promise.set_error(result_ptr.error().clone());
-      }
+      fail_promises(promises, result_ptr.move_as_error());
       return;
     }
-    do_dismiss_suggested_action(suggested_action);
-    get_app_config(Auto());
+    remove_suggested_action(suggested_actions_, suggested_action);
+    reget_app_config(Auto());
 
-    for (auto &promise : promises) {
-      promise.set_value(Unit());
-    }
-    return;
-  }
-  if (token == 6 || token == 7) {
-    is_set_archive_and_mute_request_sent_ = false;
-    bool archive_and_mute = (token == 7);
-    auto promises = std::move(set_archive_and_mute_queries_[archive_and_mute]);
-    set_archive_and_mute_queries_[archive_and_mute].clear();
-    CHECK(!promises.empty());
-    auto result_ptr = fetch_result<telegram_api::account_setGlobalPrivacySettings>(std::move(res));
-    if (result_ptr.is_error()) {
-      for (auto &promise : promises) {
-        promise.set_error(result_ptr.error().clone());
-      }
-    } else {
-      if (last_set_archive_and_mute_ == archive_and_mute) {
-        do_set_archive_and_mute(archive_and_mute);
-      }
-
-      for (auto &promise : promises) {
-        promise.set_value(Unit());
-      }
-    }
-
-    if (!set_archive_and_mute_queries_[!archive_and_mute].empty()) {
-      if (archive_and_mute == last_set_archive_and_mute_) {
-        promises = std::move(set_archive_and_mute_queries_[!archive_and_mute]);
-        set_archive_and_mute_queries_[!archive_and_mute].clear();
-        for (auto &promise : promises) {
-          promise.set_value(Unit());
-        }
-      } else {
-        set_archive_and_mute(!archive_and_mute, Auto());
-      }
-    }
-    return;
-  }
-  if (token == 5) {
-    auto promises = std::move(get_global_privacy_settings_queries_);
-    get_global_privacy_settings_queries_.clear();
-    CHECK(!promises.empty());
-    auto result_ptr = fetch_result<telegram_api::account_getGlobalPrivacySettings>(std::move(res));
-    if (result_ptr.is_error()) {
-      for (auto &promise : promises) {
-        promise.set_error(result_ptr.error().clone());
-      }
-      return;
-    }
-
-    auto result = result_ptr.move_as_ok();
-    if ((result->flags_ & telegram_api::globalPrivacySettings::ARCHIVE_AND_MUTE_NEW_NONCONTACT_PEERS_MASK) != 0) {
-      do_set_archive_and_mute(result->archive_and_mute_new_noncontact_peers_);
-    } else {
-      LOG(ERROR) << "Receive wrong response: " << to_string(result);
-    }
-
-    for (auto &promise : promises) {
-      promise.set_value(Unit());
-    }
+    set_promises(promises);
     return;
   }
   if (token == 3 || token == 4) {
     is_set_content_settings_request_sent_ = false;
     bool ignore_sensitive_content_restrictions = (token == 4);
-    auto promises = std::move(set_content_settings_queries_[ignore_sensitive_content_restrictions]);
-    set_content_settings_queries_[ignore_sensitive_content_restrictions].clear();
-    CHECK(!promises.empty());
-    auto result_ptr = fetch_result<telegram_api::account_setContentSettings>(std::move(res));
+    auto result_ptr = fetch_result<telegram_api::account_setContentSettings>(std::move(net_query));
     if (result_ptr.is_error()) {
-      for (auto &promise : promises) {
-        promise.set_error(result_ptr.error().clone());
-      }
+      fail_promises(set_content_settings_queries_[ignore_sensitive_content_restrictions], result_ptr.move_as_error());
     } else {
-      if (G()->shared_config().get_option_boolean("can_ignore_sensitive_content_restrictions") &&
+      if (G()->get_option_boolean("can_ignore_sensitive_content_restrictions") &&
           last_set_content_settings_ == ignore_sensitive_content_restrictions) {
         do_set_ignore_sensitive_content_restrictions(ignore_sensitive_content_restrictions);
       }
 
-      for (auto &promise : promises) {
-        promise.set_value(Unit());
-      }
+      set_promises(set_content_settings_queries_[ignore_sensitive_content_restrictions]);
     }
 
     if (!set_content_settings_queries_[!ignore_sensitive_content_restrictions].empty()) {
       if (ignore_sensitive_content_restrictions == last_set_content_settings_) {
-        promises = std::move(set_content_settings_queries_[!ignore_sensitive_content_restrictions]);
-        set_content_settings_queries_[!ignore_sensitive_content_restrictions].clear();
-        for (auto &promise : promises) {
-          promise.set_value(Unit());
-        }
+        set_promises(set_content_settings_queries_[!ignore_sensitive_content_restrictions]);
       } else {
         set_content_settings(!ignore_sensitive_content_restrictions, Auto());
       }
@@ -1228,71 +1189,82 @@ void ConfigManager::on_result(NetQueryPtr res) {
     return;
   }
   if (token == 2) {
-    auto promises = std::move(get_content_settings_queries_);
-    get_content_settings_queries_.clear();
-    CHECK(!promises.empty());
-    auto result_ptr = fetch_result<telegram_api::account_getContentSettings>(std::move(res));
+    auto result_ptr = fetch_result<telegram_api::account_getContentSettings>(std::move(net_query));
     if (result_ptr.is_error()) {
-      for (auto &promise : promises) {
-        promise.set_error(result_ptr.error().clone());
-      }
+      fail_promises(get_content_settings_queries_, result_ptr.move_as_error());
       return;
     }
 
     auto result = result_ptr.move_as_ok();
     do_set_ignore_sensitive_content_restrictions(result->sensitive_enabled_);
-    G()->shared_config().set_option_boolean("can_ignore_sensitive_content_restrictions", result->sensitive_can_change_);
+    G()->set_option_boolean("can_ignore_sensitive_content_restrictions", result->sensitive_can_change_);
 
-    for (auto &promise : promises) {
-      promise.set_value(Unit());
-    }
+    set_promises(get_content_settings_queries_);
     return;
   }
   if (token == 1) {
     auto promises = std::move(get_app_config_queries_);
     get_app_config_queries_.clear();
-    CHECK(!promises.empty());
-    auto result_ptr = fetch_result<telegram_api::help_getAppConfig>(std::move(res));
+    auto unit_promises = std::move(reget_app_config_queries_);
+    reget_app_config_queries_.clear();
+    CHECK(!promises.empty() || !unit_promises.empty());
+    auto result_ptr = fetch_result<telegram_api::help_getAppConfig>(std::move(net_query));
     if (result_ptr.is_error()) {
-      for (auto &promise : promises) {
-        if (!promise) {
-          promise.set_value(nullptr);
-        } else {
-          promise.set_error(result_ptr.error().clone());
-        }
-      }
+      fail_promises(promises, result_ptr.error().clone());
+      fail_promises(unit_promises, result_ptr.move_as_error());
       return;
     }
 
-    auto result = result_ptr.move_as_ok();
-    process_app_config(result);
-    for (auto &promise : promises) {
-      if (!promise) {
-        promise.set_value(nullptr);
-      } else {
-        promise.set_value(convert_json_value_object(result));
+    auto app_config_ptr = result_ptr.move_as_ok();
+    if (app_config_ptr->get_id() == telegram_api::help_appConfigNotModified::ID) {
+      if (app_config_.version_ == 0) {
+        LOG(ERROR) << "Receive appConfigNotModified";
+        fail_promises(promises, Status::Error(500, "Receive unexpected response"));
+        fail_promises(unit_promises, Status::Error(500, "Receive unexpected response"));
+        return;
       }
+      CHECK(app_config_.config_ != nullptr);
+    } else {
+      CHECK(app_config_ptr->get_id() == telegram_api::help_appConfig::ID);
+      auto app_config = telegram_api::move_object_as<telegram_api::help_appConfig>(app_config_ptr);
+      process_app_config(app_config->config_);
+      app_config_.version_ = AppConfig::CURRENT_VERSION;
+      app_config_.hash_ = app_config->hash_;
+      app_config_.config_ = std::move(app_config->config_);
+      CHECK(app_config_.config_ != nullptr);
+      G()->td_db()->get_binlog_pmc()->set("app_config", log_event_store(app_config_).as_slice().str());
     }
+    G()->get_option_manager()->update_premium_options();
+    for (auto &promise : promises) {
+      promise.set_value(convert_json_value_object(app_config_.config_));
+    }
+    set_promises(unit_promises);
     return;
   }
 
-  CHECK(token == 8);
+  CHECK(token == 8 || token == 9);
   CHECK(config_sent_cnt_ > 0);
   config_sent_cnt_--;
-  auto r_config = fetch_result<telegram_api::help_getConfig>(std::move(res));
+  auto r_config = fetch_result<telegram_api::help_getConfig>(std::move(net_query));
   if (r_config.is_error()) {
     if (!G()->close_flag()) {
       LOG(WARNING) << "Failed to get config: " << r_config.error();
       expire_time_ = Timestamp::in(60.0);  // try again in a minute
       set_timeout_in(expire_time_.in());
     }
+    fail_promises(reget_config_queries_, r_config.move_as_error());
   } else {
     on_dc_options_update(DcOptions());
     process_config(r_config.move_as_ok());
+    if (token == 9) {
+      G()->net_query_dispatcher().update_mtproto_header();
+      reopen_sessions_after_get_config_ = false;
+    }
+    set_promises(reget_config_queries_);
   }
 }
 
-void ConfigManager::save_dc_options_update(DcOptions dc_options) {
+void ConfigManager::save_dc_options_update(const DcOptions &dc_options) {
   if (dc_options.dc_options.empty()) {
     G()->td_db()->get_binlog_pmc()->erase("dc_options_update");
     return;
@@ -1324,7 +1296,7 @@ void ConfigManager::save_config_expire(Timestamp timestamp) {
 }
 
 void ConfigManager::process_config(tl_object_ptr<telegram_api::config> config) {
-  bool is_from_main_dc = G()->net_query_dispatcher().main_dc_id().get_value() == config->this_dc_;
+  bool is_from_main_dc = G()->net_query_dispatcher().get_main_dc_id().get_value() == config->this_dc_;
 
   LOG(INFO) << to_string(config);
   auto reload_in = clamp(config->expires_ - config->date_, 60, 86400);
@@ -1337,133 +1309,142 @@ void ConfigManager::process_config(tl_object_ptr<telegram_api::config> config) {
   set_timeout_at(expire_time_.at());
   LOG_IF(ERROR, config->test_mode_ != G()->is_test_dc()) << "Wrong parameter is_test";
 
-  ConfigShared &shared_config = G()->shared_config();
+  OptionManager &options = *G()->get_option_manager();
 
   // Do not save dc_options in config, because it will be interpreted and saved by ConnectionCreator.
-  send_closure(G()->connection_creator(), &ConnectionCreator::on_dc_options, DcOptions(config->dc_options_));
+  DcOptions dc_options(config->dc_options_);
+  std::stable_sort(dc_options.dc_options.begin(), dc_options.dc_options.end(),
+                   [](const DcOption &lhs, const DcOption &rhs) {
+                     if (lhs.get_dc_id() != rhs.get_dc_id()) {
+                       return lhs.get_dc_id() < rhs.get_dc_id();
+                     }
+                     return !lhs.is_ipv6() && rhs.is_ipv6();
+                   });
+  send_closure(G()->connection_creator(), &ConnectionCreator::on_dc_options, std::move(dc_options));
 
-  shared_config.set_option_integer("recent_stickers_limit", config->stickers_recent_limit_);
-  shared_config.set_option_integer("favorite_stickers_limit", config->stickers_faved_limit_);
-  shared_config.set_option_integer("saved_animations_limit", config->saved_gifs_limit_);
-  shared_config.set_option_integer("channels_read_media_period", config->channels_read_media_period_);
+  options.set_option_integer("recent_stickers_limit", config->stickers_recent_limit_);
+  options.set_option_integer("channels_read_media_period", config->channels_read_media_period_);
 
-  shared_config.set_option_boolean("test_mode", config->test_mode_);
-  shared_config.set_option_integer("forwarded_message_count_max", config->forwarded_count_max_);
-  shared_config.set_option_integer("basic_group_size_max", config->chat_size_max_);
-  shared_config.set_option_integer("supergroup_size_max", config->megagroup_size_max_);
-  shared_config.set_option_integer("pinned_chat_count_max", config->pinned_dialogs_count_max_);
-  shared_config.set_option_integer("pinned_archived_chat_count_max", config->pinned_infolder_count_max_);
-  if (is_from_main_dc || !shared_config.have_option("expect_blocking")) {
-    shared_config.set_option_boolean("expect_blocking",
-                                     (config->flags_ & telegram_api::config::BLOCKED_MODE_MASK) != 0);
+  send_closure(G()->link_manager(), &LinkManager::update_autologin_token, std::move(config->autologin_token_));
+
+  options.set_option_boolean("test_mode", config->test_mode_);
+  options.set_option_integer("forwarded_message_count_max", config->forwarded_count_max_);
+  options.set_option_integer("basic_group_size_max", config->chat_size_max_);
+  options.set_option_integer("supergroup_size_max", config->megagroup_size_max_);
+  if (is_from_main_dc || !options.have_option("expect_blocking")) {
+    options.set_option_boolean("expect_blocking", config->blocked_mode_);
   }
-  if (is_from_main_dc || !shared_config.have_option("dc_txt_domain_name")) {
-    shared_config.set_option_string("dc_txt_domain_name", config->dc_txt_domain_name_);
+  if (is_from_main_dc || !options.have_option("dc_txt_domain_name")) {
+    options.set_option_string("dc_txt_domain_name", config->dc_txt_domain_name_);
   }
-  if (is_from_main_dc || !shared_config.have_option("t_me_url")) {
+  if (is_from_main_dc || !options.have_option("t_me_url")) {
     auto url = config->me_url_prefix_;
     if (!url.empty()) {
       if (url.back() != '/') {
         url.push_back('/');
       }
-      shared_config.set_option_string("t_me_url", url);
+      options.set_option_string("t_me_url", url);
     }
   }
   if (is_from_main_dc) {
-    shared_config.set_option_integer("webfile_dc_id", config->webfile_dc_id_);
-    if ((config->flags_ & telegram_api::config::TMP_SESSIONS_MASK) != 0) {
-      shared_config.set_option_integer("session_count", config->tmp_sessions_);
+    options.set_option_integer("webfile_dc_id", config->webfile_dc_id_);
+    if ((config->flags_ & telegram_api::config::TMP_SESSIONS_MASK) != 0 && config->tmp_sessions_ > 1) {
+      options.set_option_integer("session_count", config->tmp_sessions_);
     } else {
-      shared_config.set_option_empty("session_count");
+      options.set_option_empty("session_count");
     }
     if ((config->flags_ & telegram_api::config::SUGGESTED_LANG_CODE_MASK) != 0) {
-      shared_config.set_option_string("suggested_language_pack_id", config->suggested_lang_code_);
-      shared_config.set_option_integer("language_pack_version", config->lang_pack_version_);
-      shared_config.set_option_integer("base_language_pack_version", config->base_lang_pack_version_);
+      options.set_option_string("suggested_language_pack_id", config->suggested_lang_code_);
+      options.set_option_integer("language_pack_version", config->lang_pack_version_);
+      options.set_option_integer("base_language_pack_version", config->base_lang_pack_version_);
     } else {
-      shared_config.set_option_empty("suggested_language_pack_id");
-      shared_config.set_option_empty("language_pack_version");
-      shared_config.set_option_empty("base_language_pack_version");
+      options.set_option_empty("suggested_language_pack_id");
+      options.set_option_empty("language_pack_version");
+      options.set_option_empty("base_language_pack_version");
     }
   }
 
   if (is_from_main_dc) {
-    shared_config.set_option_integer("edit_time_limit", config->edit_time_limit_);
-    shared_config.set_option_boolean("revoke_pm_inbox",
-                                     (config->flags_ & telegram_api::config::REVOKE_PM_INBOX_MASK) != 0);
-    shared_config.set_option_integer("revoke_time_limit", config->revoke_time_limit_);
-    shared_config.set_option_integer("revoke_pm_time_limit", config->revoke_pm_time_limit_);
+    options.set_option_integer("edit_time_limit", config->edit_time_limit_);
+    options.set_option_boolean("revoke_pm_inbox", config->revoke_pm_inbox_);
+    options.set_option_integer("revoke_time_limit", config->revoke_time_limit_);
+    options.set_option_integer("revoke_pm_time_limit", config->revoke_pm_time_limit_);
 
-    shared_config.set_option_integer("rating_e_decay", config->rating_e_decay_);
-
-    shared_config.set_option_boolean("calls_enabled", config->phonecalls_enabled_);
+    options.set_option_integer("rating_e_decay", config->rating_e_decay_);
   }
-  shared_config.set_option_integer("call_ring_timeout_ms", config->call_ring_timeout_ms_);
-  shared_config.set_option_integer("call_connect_timeout_ms", config->call_connect_timeout_ms_);
-  shared_config.set_option_integer("call_packet_timeout_ms", config->call_packet_timeout_ms_);
-  shared_config.set_option_integer("call_receive_timeout_ms", config->call_receive_timeout_ms_);
+  options.set_option_integer("call_ring_timeout_ms", config->call_ring_timeout_ms_);
+  options.set_option_integer("call_connect_timeout_ms", config->call_connect_timeout_ms_);
+  options.set_option_integer("call_packet_timeout_ms", config->call_packet_timeout_ms_);
+  options.set_option_integer("call_receive_timeout_ms", config->call_receive_timeout_ms_);
 
-  shared_config.set_option_integer("message_text_length_max", config->message_length_max_);
-  shared_config.set_option_integer("message_caption_length_max", config->caption_length_max_);
+  options.set_option_integer("message_text_length_max", clamp(config->message_length_max_, 4096, 1000000));
+  options.set_option_integer("message_caption_length_max", clamp(config->caption_length_max_, 1024, 1000000));
 
   if (config->gif_search_username_.empty()) {
-    shared_config.set_option_empty("animation_search_bot_username");
+    options.set_option_empty("animation_search_bot_username");
   } else {
-    shared_config.set_option_string("animation_search_bot_username", config->gif_search_username_);
+    options.set_option_string("animation_search_bot_username", config->gif_search_username_);
   }
-  if (config->venue_search_username_.empty()) {
-    shared_config.set_option_empty("venue_search_bot_username");
-  } else {
-    shared_config.set_option_string("venue_search_bot_username", config->venue_search_username_);
+  if (!options.have_option("venue_search_bot_username")) {
+    if (config->venue_search_username_.empty()) {
+      options.set_option_empty("venue_search_bot_username");
+    } else {
+      options.set_option_string("venue_search_bot_username", config->venue_search_username_);
+    }
   }
   if (config->img_search_username_.empty()) {
-    shared_config.set_option_empty("photo_search_bot_username");
+    options.set_option_empty("photo_search_bot_username");
   } else {
-    shared_config.set_option_string("photo_search_bot_username", config->img_search_username_);
+    options.set_option_string("photo_search_bot_username", config->img_search_username_);
   }
 
   auto fix_timeout_ms = [](int32 timeout_ms) {
     return clamp(timeout_ms, 1000, 86400 * 1000);
   };
 
-  shared_config.set_option_integer("online_update_period_ms", fix_timeout_ms(config->online_update_period_ms_));
+  options.set_option_integer("online_update_period_ms", fix_timeout_ms(config->online_update_period_ms_));
 
-  shared_config.set_option_integer("online_cloud_timeout_ms", fix_timeout_ms(config->online_cloud_timeout_ms_));
-  shared_config.set_option_integer("notification_cloud_delay_ms", fix_timeout_ms(config->notify_cloud_delay_ms_));
-  shared_config.set_option_integer("notification_default_delay_ms", fix_timeout_ms(config->notify_default_delay_ms_));
+  options.set_option_integer("online_cloud_timeout_ms", fix_timeout_ms(config->online_cloud_timeout_ms_));
+  options.set_option_integer("notification_cloud_delay_ms", fix_timeout_ms(config->notify_cloud_delay_ms_));
+  options.set_option_integer("notification_default_delay_ms", fix_timeout_ms(config->notify_default_delay_ms_));
+
+  if (is_from_main_dc && !options.have_option("default_reaction_need_sync")) {
+    ReactionType reaction_type(config->reactions_default_);
+    if (!reaction_type.is_empty()) {
+      options.set_option_string("default_reaction", reaction_type.get_string());
+    }
+  }
 
   // delete outdated options
-  shared_config.set_option_empty("suggested_language_code");
-  shared_config.set_option_empty("chat_big_size");
-  shared_config.set_option_empty("group_size_max");
-  shared_config.set_option_empty("saved_gifs_limit");
-  shared_config.set_option_empty("sessions_count");
-  shared_config.set_option_empty("forwarded_messages_count_max");
-  shared_config.set_option_empty("broadcast_size_max");
-  shared_config.set_option_empty("group_chat_size_max");
-  shared_config.set_option_empty("chat_size_max");
-  shared_config.set_option_empty("megagroup_size_max");
-  shared_config.set_option_empty("offline_blur_timeout_ms");
-  shared_config.set_option_empty("offline_idle_timeout_ms");
-  shared_config.set_option_empty("notify_cloud_delay_ms");
-  shared_config.set_option_empty("notify_default_delay_ms");
-  shared_config.set_option_empty("large_chat_size");
+  options.set_option_empty("suggested_language_code");
+  options.set_option_empty("chat_big_size");
+  options.set_option_empty("group_size_max");
+  options.set_option_empty("saved_gifs_limit");
+  options.set_option_empty("sessions_count");
+  options.set_option_empty("forwarded_messages_count_max");
+  options.set_option_empty("broadcast_size_max");
+  options.set_option_empty("group_chat_size_max");
+  options.set_option_empty("chat_size_max");
+  options.set_option_empty("megagroup_size_max");
+  options.set_option_empty("offline_blur_timeout_ms");
+  options.set_option_empty("offline_idle_timeout_ms");
+  options.set_option_empty("notify_cloud_delay_ms");
+  options.set_option_empty("notify_default_delay_ms");
+  options.set_option_empty("large_chat_size");
+  options.set_option_empty("calls_enabled");
 
   // TODO implement online status updates
-  //  shared_config.set_option_integer("offline_blur_timeout_ms", config->offline_blur_timeout_ms_);
-  //  shared_config.set_option_integer("offline_idle_timeout_ms", config->offline_idle_timeout_ms_);
+  //  options.set_option_integer("offline_blur_timeout_ms", config->offline_blur_timeout_ms_);
+  //  options.set_option_integer("offline_idle_timeout_ms", config->offline_idle_timeout_ms_);
 
-  //  shared_config.set_option_integer("push_chat_period_ms", config->push_chat_period_ms_);
-  //  shared_config.set_option_integer("push_chat_limit", config->push_chat_limit_);
+  //  options.set_option_integer("push_chat_period_ms", config->push_chat_period_ms_);
+  //  options.set_option_integer("push_chat_limit", config->push_chat_limit_);
 
   if (is_from_main_dc) {
-    get_app_config(Auto());
-    if (!shared_config.have_option("can_ignore_sensitive_content_restrictions") ||
-        !shared_config.have_option("ignore_sensitive_content_restrictions")) {
+    reget_app_config(Auto());
+    if (!options.have_option("can_ignore_sensitive_content_restrictions") ||
+        !options.have_option("ignore_sensitive_content_restrictions")) {
       get_content_settings(Auto());
-    }
-    if (!shared_config.have_option("archive_and_mute_new_chats_from_unknown_users")) {
-      get_global_privacy_settings(Auto());
     }
   }
 }
@@ -1472,41 +1453,68 @@ void ConfigManager::process_app_config(tl_object_ptr<telegram_api::JSONValue> &c
   CHECK(config != nullptr);
   LOG(INFO) << "Receive app config " << to_string(config);
 
-  const bool archive_and_mute =
-      G()->shared_config().get_option_boolean("archive_and_mute_new_chats_from_unknown_users");
+  vector<string> autologin_domains;
+  vector<string> url_auth_domains;
+  vector<string> whitelisted_domains;
 
   vector<tl_object_ptr<telegram_api::jsonObjectValue>> new_values;
   string ignored_restriction_reasons;
+  string restriction_add_platforms;
   vector<string> dice_emojis;
-  std::unordered_map<string, size_t> dice_emoji_index;
-  std::unordered_map<string, string> dice_emoji_success_value;
+  FlatHashMap<string, size_t> dice_emoji_index;
+  FlatHashMap<string, string> dice_emoji_success_value;
+  vector<string> emoji_sounds;
   string animation_search_provider;
   string animation_search_emojis;
   vector<SuggestedAction> suggested_actions;
+  bool can_archive_and_mute_new_chats_from_unknown_users = false;
+  int32 chat_read_mark_expire_period = 0;
+  int32 chat_read_mark_size_threshold = 0;
+  double animated_emoji_zoom = 0.0;
+  int32 reactions_uniq_max = 0;
+  vector<string> premium_features;
+  auto &premium_limit_keys = get_premium_limit_keys();
+  string premium_bot_username;
+  string premium_invoice_slug;
+  bool is_premium_available = false;
+  int32 stickers_premium_by_emoji_num = 0;
+  int32 stickers_normal_by_emoji_per_premium_num = 2;
+  int32 telegram_antispam_group_size_min = 100;
+  int32 topics_pinned_limit = -1;
+  vector<string> fragment_prefixes;
+  bool premium_gift_attach_menu_icon = false;
+  bool premium_gift_text_field_icon = false;
+  int32 dialog_filter_update_period = 300;
+  // bool archive_all_stories = false;
+  int32 story_viewers_expire_period = 86400;
+  int64 stories_changelog_user_id = ContactsManager::get_service_notifications_user_id().get();
+  int32 transcribe_audio_trial_weekly_number = 0;
+  int32 transcribe_audio_trial_duration_max = 0;
+  int32 transcribe_audio_trial_cooldown_until = 0;
   if (config->get_id() == telegram_api::jsonObject::ID) {
     for (auto &key_value : static_cast<telegram_api::jsonObject *>(config.get())->value_) {
       Slice key = key_value->key_;
       telegram_api::JSONValue *value = key_value->value_.get();
-      if (key == "test" || key == "wallet_enabled" || key == "wallet_blockchain_name" || key == "wallet_config") {
+      if (key == "default_emoji_statuses_stickerset_id" || key == "forum_upgrade_participants_min" ||
+          key == "getfile_experimental_params" || key == "message_animated_emoji_max" ||
+          key == "stickers_emoji_cache_time" || key == "stories_export_nopublic_link" || key == "test" ||
+          key == "upload_max_fileparts_default" || key == "upload_max_fileparts_premium" ||
+          key == "wallet_blockchain_name" || key == "wallet_config" || key == "wallet_enabled" ||
+          key == "channel_color_level_min") {
         continue;
       }
       if (key == "ignore_restriction_reasons") {
         if (value->get_id() == telegram_api::jsonArray::ID) {
           auto reasons = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
           for (auto &reason : reasons) {
-            CHECK(reason != nullptr);
-            if (reason->get_id() == telegram_api::jsonString::ID) {
-              Slice reason_name = static_cast<telegram_api::jsonString *>(reason.get())->value_;
-              if (!reason_name.empty() && reason_name.find(',') == Slice::npos) {
-                if (!ignored_restriction_reasons.empty()) {
-                  ignored_restriction_reasons += ',';
-                }
-                ignored_restriction_reasons.append(reason_name.begin(), reason_name.end());
-              } else {
-                LOG(ERROR) << "Receive unexpected restriction reason " << reason_name;
+            auto reason_name = get_json_value_string(std::move(reason), key);
+            if (!reason_name.empty() && reason_name.find(',') == string::npos) {
+              if (!ignored_restriction_reasons.empty()) {
+                ignored_restriction_reasons += ',';
               }
+              ignored_restriction_reasons += reason_name;
             } else {
-              LOG(ERROR) << "Receive unexpected restriction reason " << to_string(reason);
+              LOG(ERROR) << "Receive unexpected restriction reason " << reason_name;
             }
           }
         } else {
@@ -1514,21 +1522,39 @@ void ConfigManager::process_app_config(tl_object_ptr<telegram_api::JSONValue> &c
         }
         continue;
       }
+      if (key == "restriction_add_platforms") {
+        if (value->get_id() == telegram_api::jsonArray::ID) {
+          auto platforms = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
+          for (auto &platform : platforms) {
+            auto platform_name = get_json_value_string(std::move(platform), key);
+            if (!platform_name.empty() && platform_name.find(',') == string::npos) {
+              if (!restriction_add_platforms.empty()) {
+                restriction_add_platforms += ',';
+              }
+              restriction_add_platforms += platform_name;
+            } else {
+              LOG(ERROR) << "Receive unexpected restriction platform " << platform_name;
+            }
+          }
+        } else {
+          LOG(ERROR) << "Receive unexpected restriction_add_platforms " << to_string(*value);
+        }
+        continue;
+      }
+      if (key == "emojies_animated_zoom") {
+        animated_emoji_zoom = get_json_value_double(std::move(key_value->value_), key);
+        continue;
+      }
       if (key == "emojies_send_dice") {
         if (value->get_id() == telegram_api::jsonArray::ID) {
           auto emojis = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
           for (auto &emoji : emojis) {
-            CHECK(emoji != nullptr);
-            if (emoji->get_id() == telegram_api::jsonString::ID) {
-              Slice emoji_text = static_cast<telegram_api::jsonString *>(emoji.get())->value_;
-              if (!emoji_text.empty()) {
-                dice_emoji_index[emoji_text.str()] = dice_emojis.size();
-                dice_emojis.push_back(emoji_text.str());
-              } else {
-                LOG(ERROR) << "Receive empty dice emoji";
-              }
+            auto emoji_text = get_json_value_string(std::move(emoji), key);
+            if (!emoji_text.empty()) {
+              dice_emoji_index[emoji_text] = dice_emojis.size();
+              dice_emojis.push_back(emoji_text);
             } else {
-              LOG(ERROR) << "Receive unexpected dice emoji " << to_string(emoji);
+              LOG(ERROR) << "Receive empty dice emoji";
             }
           }
         } else {
@@ -1541,7 +1567,7 @@ void ConfigManager::process_app_config(tl_object_ptr<telegram_api::JSONValue> &c
           auto success_values = std::move(static_cast<telegram_api::jsonObject *>(value)->value_);
           for (auto &success_value : success_values) {
             CHECK(success_value != nullptr);
-            if (success_value->value_->get_id() == telegram_api::jsonObject::ID) {
+            if (!success_value->key_.empty() && success_value->value_->get_id() == telegram_api::jsonObject::ID) {
               int32 dice_value = -1;
               int32 frame_start = -1;
               for (auto &dice_key_value :
@@ -1549,8 +1575,7 @@ void ConfigManager::process_app_config(tl_object_ptr<telegram_api::JSONValue> &c
                 if (dice_key_value->value_->get_id() != telegram_api::jsonNumber::ID) {
                   continue;
                 }
-                auto current_value =
-                    static_cast<int32>(static_cast<telegram_api::jsonNumber *>(dice_key_value->value_.get())->value_);
+                auto current_value = get_json_value_int(std::move(dice_key_value->value_), Slice());
                 if (dice_key_value->key_ == "value") {
                   dice_value = current_value;
                 }
@@ -1572,31 +1597,60 @@ void ConfigManager::process_app_config(tl_object_ptr<telegram_api::JSONValue> &c
         }
         continue;
       }
-      if (key == "gif_search_branding") {
-        if (value->get_id() == telegram_api::jsonString::ID) {
-          animation_search_provider = std::move(static_cast<telegram_api::jsonString *>(value)->value_);
+      if (key == "emojies_sounds") {
+        if (value->get_id() == telegram_api::jsonObject::ID) {
+          auto sounds = std::move(static_cast<telegram_api::jsonObject *>(value)->value_);
+          for (auto &sound : sounds) {
+            CHECK(sound != nullptr);
+            if (sound->value_->get_id() == telegram_api::jsonObject::ID) {
+              string id;
+              string access_hash;
+              string file_reference_base64;
+              for (auto &sound_key_value : static_cast<telegram_api::jsonObject *>(sound->value_.get())->value_) {
+                if (sound_key_value->value_->get_id() != telegram_api::jsonString::ID) {
+                  continue;
+                }
+                auto current_value = get_json_value_string(std::move(sound_key_value->value_), Slice());
+                if (sound_key_value->key_ == "id") {
+                  id = std::move(current_value);
+                } else if (sound_key_value->key_ == "access_hash") {
+                  access_hash = std::move(current_value);
+                } else if (sound_key_value->key_ == "file_reference_base64") {
+                  file_reference_base64 = std::move(current_value);
+                }
+              }
+              if (to_integer_safe<int64>(id).is_error() || to_integer_safe<int64>(access_hash).is_error() ||
+                  !is_base64url(file_reference_base64) || !is_emoji(sound->key_)) {
+                LOG(ERROR) << "Receive unexpected sound value " << to_string(sound);
+              } else {
+                emoji_sounds.push_back(sound->key_);
+                emoji_sounds.push_back(PSTRING() << id << ':' << access_hash << ':' << file_reference_base64);
+              }
+            } else {
+              LOG(ERROR) << "Receive unexpected emoji sound " << to_string(sound);
+            }
+          }
         } else {
-          LOG(ERROR) << "Receive unexpected gif_search_branding " << to_string(*value);
+          LOG(ERROR) << "Receive unexpected emojies_sounds " << to_string(*value);
         }
+        continue;
+      }
+      if (key == "gif_search_branding") {
+        animation_search_provider = get_json_value_string(std::move(key_value->value_), key);
         continue;
       }
       if (key == "gif_search_emojies") {
         if (value->get_id() == telegram_api::jsonArray::ID) {
           auto emojis = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
           for (auto &emoji : emojis) {
-            CHECK(emoji != nullptr);
-            if (emoji->get_id() == telegram_api::jsonString::ID) {
-              Slice emoji_str = static_cast<telegram_api::jsonString *>(emoji.get())->value_;
-              if (!emoji_str.empty() && emoji_str.find(',') == Slice::npos) {
-                if (!animation_search_emojis.empty()) {
-                  animation_search_emojis += ',';
-                }
-                animation_search_emojis.append(emoji_str.begin(), emoji_str.end());
-              } else {
-                LOG(ERROR) << "Receive unexpected animation search emoji " << emoji_str;
+            auto emoji_str = get_json_value_string(std::move(emoji), key);
+            if (!emoji_str.empty() && emoji_str.find(',') == string::npos) {
+              if (!animation_search_emojis.empty()) {
+                animation_search_emojis += ',';
               }
+              animation_search_emojis += emoji_str;
             } else {
-              LOG(ERROR) << "Receive unexpected animation search emoji " << to_string(emoji);
+              LOG(ERROR) << "Receive unexpected animation search emoji " << emoji_str;
             }
           }
         } else {
@@ -1607,27 +1661,322 @@ void ConfigManager::process_app_config(tl_object_ptr<telegram_api::JSONValue> &c
       if (key == "pending_suggestions") {
         if (value->get_id() == telegram_api::jsonArray::ID) {
           auto actions = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
+          auto otherwise_relogin_days = G()->get_option_integer("otherwise_relogin_days");
           for (auto &action : actions) {
-            CHECK(action != nullptr);
-            if (action->get_id() == telegram_api::jsonString::ID) {
-              Slice action_str = static_cast<telegram_api::jsonString *>(action.get())->value_;
-              auto suggested_action = get_suggested_action(action_str);
-              if (suggested_action != SuggestedAction::Empty) {
-                if (archive_and_mute && suggested_action == SuggestedAction::EnableArchiveAndMuteNewChats) {
-                  LOG(INFO) << "Skip SuggestedAction::EnableArchiveAndMuteNewChats";
-                } else {
-                  suggested_actions.push_back(suggested_action);
-                }
+            auto action_str = get_json_value_string(std::move(action), key);
+            SuggestedAction suggested_action(action_str);
+            if (!suggested_action.is_empty()) {
+              if (otherwise_relogin_days > 0 &&
+                  suggested_action == SuggestedAction{SuggestedAction::Type::SetPassword}) {
+                LOG(INFO) << "Skip SetPassword suggested action";
               } else {
-                LOG(ERROR) << "Receive unsupported suggested action " << action_str;
+                suggested_actions.push_back(suggested_action);
               }
             } else {
-              LOG(ERROR) << "Receive unexpected suggested action " << to_string(action);
+              LOG(ERROR) << "Receive unsupported suggested action " << action_str;
             }
           }
         } else {
           LOG(ERROR) << "Receive unexpected pending_suggestions " << to_string(*value);
         }
+        continue;
+      }
+      if (key == "autoarchive_setting_available") {
+        can_archive_and_mute_new_chats_from_unknown_users = get_json_value_bool(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "autologin_domains") {
+        if (value->get_id() == telegram_api::jsonArray::ID) {
+          auto domains = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
+          for (auto &domain : domains) {
+            autologin_domains.push_back(get_json_value_string(std::move(domain), key));
+          }
+        } else {
+          LOG(ERROR) << "Receive unexpected autologin_domains " << to_string(*value);
+        }
+        continue;
+      }
+      if (key == "url_auth_domains") {
+        if (value->get_id() == telegram_api::jsonArray::ID) {
+          auto domains = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
+          for (auto &domain : domains) {
+            url_auth_domains.push_back(get_json_value_string(std::move(domain), key));
+          }
+        } else {
+          LOG(ERROR) << "Receive unexpected url_auth_domains " << to_string(*value);
+        }
+        continue;
+      }
+      if (key == "whitelisted_domains") {
+        if (value->get_id() == telegram_api::jsonArray::ID) {
+          auto domains = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
+          for (auto &domain : domains) {
+            whitelisted_domains.push_back(get_json_value_string(std::move(domain), key));
+          }
+        } else {
+          LOG(ERROR) << "Receive unexpected whitelisted_domains " << to_string(*value);
+        }
+        continue;
+      }
+      if (key == "round_video_encoding") {
+        if (value->get_id() == telegram_api::jsonObject::ID) {
+          auto video_note_settings = std::move(static_cast<telegram_api::jsonObject *>(value)->value_);
+          for (auto &video_note_setting : video_note_settings) {
+            CHECK(video_note_setting != nullptr);
+            if (video_note_setting->key_ != "diameter" && video_note_setting->key_ != "video_bitrate" &&
+                video_note_setting->key_ != "audio_bitrate" && video_note_setting->key_ != "max_size") {
+              continue;
+            }
+            if (video_note_setting->value_->get_id() == telegram_api::jsonNumber::ID) {
+              auto setting_value = get_json_value_int(std::move(video_note_setting->value_), Slice());
+              if (setting_value > 0) {
+                if (video_note_setting->key_ == "diameter") {
+                  G()->set_option_integer("suggested_video_note_length", setting_value);
+                }
+                if (video_note_setting->key_ == "video_bitrate") {
+                  G()->set_option_integer("suggested_video_note_video_bitrate", setting_value);
+                }
+                if (video_note_setting->key_ == "audio_bitrate") {
+                  G()->set_option_integer("suggested_video_note_audio_bitrate", setting_value);
+                }
+                if (video_note_setting->key_ == "max_size") {
+                  G()->set_option_integer("video_note_size_max", setting_value);
+                }
+              }
+            } else {
+              LOG(ERROR) << "Receive unexpected video note setting " << to_string(video_note_setting);
+            }
+          }
+        } else {
+          LOG(ERROR) << "Receive unexpected round_video_encoding " << to_string(*value);
+        }
+        continue;
+      }
+      if (key == "chat_read_mark_expire_period") {
+        chat_read_mark_expire_period = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "chat_read_mark_size_threshold") {
+        chat_read_mark_size_threshold = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "reactions_uniq_max") {
+        reactions_uniq_max = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "ringtone_duration_max") {
+        auto setting_value = get_json_value_int(std::move(key_value->value_), key);
+        G()->set_option_integer("notification_sound_duration_max", setting_value);
+        continue;
+      }
+      if (key == "ringtone_size_max") {
+        auto setting_value = get_json_value_int(std::move(key_value->value_), key);
+        G()->set_option_integer("notification_sound_size_max", setting_value);
+        continue;
+      }
+      if (key == "ringtone_saved_count_max") {
+        auto setting_value = get_json_value_int(std::move(key_value->value_), key);
+        G()->set_option_integer("notification_sound_count_max", setting_value);
+        continue;
+      }
+      if (key == "premium_promo_order") {
+        if (value->get_id() == telegram_api::jsonArray::ID) {
+          auto features = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
+          for (auto &feature : features) {
+            auto premium_feature = get_json_value_string(std::move(feature), key);
+            if (!td::contains(premium_feature, ',')) {
+              premium_features.push_back(std::move(premium_feature));
+            }
+          }
+        } else {
+          LOG(ERROR) << "Receive unexpected premium_promo_order " << to_string(*value);
+        }
+        continue;
+      }
+      bool is_premium_limit_key = false;
+      for (auto premium_limit_key : premium_limit_keys) {
+        if (begins_with(key, premium_limit_key)) {
+          auto suffix = key.substr(premium_limit_key.size());
+          if (suffix == "_limit_default" || suffix == "_limit_premium") {
+            auto setting_value = get_json_value_int(std::move(key_value->value_), key);
+            if (setting_value > 0) {
+              G()->set_option_integer(key, setting_value);
+            } else {
+              LOG(ERROR) << "Receive invalid value " << setting_value << " for " << key;
+            }
+            is_premium_limit_key = true;
+            break;
+          }
+        }
+      }
+      if (is_premium_limit_key) {
+        continue;
+      }
+      if (key == "premium_bot_username") {
+        premium_bot_username = get_json_value_string(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "premium_invoice_slug") {
+        premium_invoice_slug = get_json_value_string(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "premium_purchase_blocked") {
+        is_premium_available = !get_json_value_bool(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "stickers_premium_by_emoji_num") {
+        stickers_premium_by_emoji_num = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "stickers_normal_by_emoji_per_premium_num") {
+        stickers_normal_by_emoji_per_premium_num = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "reactions_user_max_default" || key == "reactions_user_max_premium") {
+        auto setting_value = get_json_value_int(std::move(key_value->value_), key);
+        G()->set_option_integer(key, setting_value);
+        continue;
+      }
+      if (key == "telegram_antispam_user_id") {
+        auto setting_value = get_json_value_long(std::move(key_value->value_), key);
+        G()->set_option_integer("anti_spam_bot_user_id", setting_value);
+        continue;
+      }
+      if (key == "telegram_antispam_group_size_min") {
+        telegram_antispam_group_size_min = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "fragment_prefixes") {
+        if (value->get_id() == telegram_api::jsonArray::ID) {
+          auto prefixes = std::move(static_cast<telegram_api::jsonArray *>(value)->value_);
+          for (auto &prefix : prefixes) {
+            auto prefix_text = get_json_value_string(std::move(prefix), key);
+            clean_phone_number(prefix_text);
+            if (!prefix_text.empty()) {
+              fragment_prefixes.push_back(prefix_text);
+            } else {
+              LOG(ERROR) << "Receive an invalid Fragment prefix";
+            }
+          }
+        } else {
+          LOG(ERROR) << "Receive unexpected fragment_prefixes " << to_string(*value);
+        }
+        continue;
+      }
+      if (key == "hidden_members_group_size_min") {
+        auto setting_value = get_json_value_int(std::move(key_value->value_), key);
+        G()->set_option_integer("hidden_members_group_size_min", setting_value);
+        continue;
+      }
+      if (key == "topics_pinned_limit") {
+        topics_pinned_limit = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "premium_gift_attach_menu_icon") {
+        premium_gift_attach_menu_icon = get_json_value_bool(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "premium_gift_text_field_icon") {
+        premium_gift_text_field_icon = get_json_value_bool(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "chatlist_update_period") {
+        dialog_filter_update_period = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "stories_all_hidden") {
+        // archive_all_stories = get_json_value_bool(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "story_viewers_expire_period") {
+        story_viewers_expire_period = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "stories_changelog_user_id") {
+        stories_changelog_user_id = get_json_value_long(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "stories_venue_search_username") {
+        G()->set_option_string("venue_search_bot_username", get_json_value_string(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "stories_stealth_past_period") {
+        G()->set_option_integer("story_stealth_mode_past_period",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "stories_stealth_future_period") {
+        G()->set_option_integer("story_stealth_mode_future_period",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "stories_stealth_cooldown_period") {
+        G()->set_option_integer("story_stealth_mode_cooldown_period",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "stories_entities") {
+        G()->set_option_boolean("need_premium_for_story_caption_entities",
+                                get_json_value_string(std::move(key_value->value_), key) == "premium");
+        continue;
+      }
+      if (key == "authorization_autoconfirm_period") {
+        G()->set_option_integer("authorization_autoconfirm_period",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "giveaway_add_peers_max") {
+        G()->set_option_integer("giveaway_additional_chat_count_max",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "giveaway_countries_max") {
+        G()->set_option_integer("giveaway_country_count_max", get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "giveaway_boosts_per_premium") {
+        G()->set_option_integer("giveaway_boost_count_per_premium",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "giveaway_period_max") {
+        G()->set_option_integer("giveaway_duration_max", get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "boosts_per_sent_gift") {
+        G()->set_option_integer("premium_gift_boost_count", get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "quote_length_max") {
+        G()->set_option_integer("message_reply_quote_length_max",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "transcribe_audio_trial_weekly_number") {
+        transcribe_audio_trial_weekly_number = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "transcribe_audio_trial_duration_max") {
+        transcribe_audio_trial_duration_max = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "transcribe_audio_trial_cooldown_until") {
+        transcribe_audio_trial_cooldown_until = get_json_value_int(std::move(key_value->value_), key);
+        continue;
+      }
+      if (key == "boosts_channel_level_max") {
+        G()->set_option_integer("chat_boost_level_max", max(0, get_json_value_int(std::move(key_value->value_), key)));
+        continue;
+      }
+      if (key == "reactions_in_chat_max") {
+        G()->set_option_integer("chat_available_reaction_count_max",
+                                get_json_value_int(std::move(key_value->value_), key));
+        continue;
+      }
+      if (key == "channel_bg_icon_level_min" || key == "channel_custom_wallpaper_level_min" ||
+          key == "channel_emoji_status_level_min" || key == "channel_profile_bg_icon_level_min" ||
+          key == "channel_wallpaper_level_min" || key == "pm_read_date_expire_period") {
+        G()->set_option_integer(key, get_json_value_int(std::move(key_value->value_), key));
         continue;
       }
 
@@ -1638,81 +1987,166 @@ void ConfigManager::process_app_config(tl_object_ptr<telegram_api::JSONValue> &c
   }
   config = make_tl_object<telegram_api::jsonObject>(std::move(new_values));
 
-  ConfigShared &shared_config = G()->shared_config();
+  send_closure(G()->link_manager(), &LinkManager::update_autologin_domains, std::move(autologin_domains),
+               std::move(url_auth_domains), std::move(whitelisted_domains));
+
+  send_closure(G()->transcription_manager(), &TranscriptionManager::on_update_trial_parameters,
+               transcribe_audio_trial_weekly_number, transcribe_audio_trial_duration_max,
+               transcribe_audio_trial_cooldown_until);
+
+  Global &options = *G();
 
   if (ignored_restriction_reasons.empty()) {
-    shared_config.set_option_empty("ignored_restriction_reasons");
+    options.set_option_empty("ignored_restriction_reasons");
 
-    if (shared_config.get_option_boolean("ignore_sensitive_content_restrictions", true)) {
+    if (options.get_option_boolean("ignore_sensitive_content_restrictions", true) ||
+        options.get_option_boolean("can_ignore_sensitive_content_restrictions", true)) {
       get_content_settings(Auto());
     }
   } else {
-    shared_config.set_option_string("ignored_restriction_reasons", ignored_restriction_reasons);
+    options.set_option_string("ignored_restriction_reasons", ignored_restriction_reasons);
 
-    if (!shared_config.get_option_boolean("can_ignore_sensitive_content_restrictions")) {
+    if (!options.get_option_boolean("can_ignore_sensitive_content_restrictions") ||
+        !options.get_option_boolean("ignore_sensitive_content_restrictions")) {
       get_content_settings(Auto());
     }
+  }
+  if (restriction_add_platforms.empty()) {
+    options.set_option_empty("restriction_add_platforms");
+  } else {
+    options.set_option_string("restriction_add_platforms", restriction_add_platforms);
   }
 
   if (!dice_emojis.empty()) {
     vector<string> dice_success_values(dice_emojis.size());
     for (auto &it : dice_emoji_success_value) {
-      if (dice_emoji_index.find(it.first) == dice_emoji_index.end()) {
+      auto dice_emoji_it = dice_emoji_index.find(it.first);
+      if (dice_emoji_it == dice_emoji_index.end()) {
         LOG(ERROR) << "Can't find emoji " << it.first;
         continue;
       }
-      dice_success_values[dice_emoji_index[it.first]] = it.second;
+      dice_success_values[dice_emoji_it->second] = it.second;
     }
-    shared_config.set_option_string("dice_success_values", implode(dice_success_values, ','));
-    shared_config.set_option_string("dice_emojis", implode(dice_emojis, '\x01'));
+    options.set_option_string("dice_success_values", implode(dice_success_values, ','));
+    options.set_option_string("dice_emojis", implode(dice_emojis, '\x01'));
   }
 
-  if (animation_search_provider.empty()) {
-    shared_config.set_option_empty("animation_search_provider");
+  options.set_option_string("fragment_prefixes", implode(fragment_prefixes, ','));
+
+  options.set_option_string("emoji_sounds", implode(emoji_sounds, ','));
+
+  if (animated_emoji_zoom <= 0 || animated_emoji_zoom > 2.0) {
+    options.set_option_empty("animated_emoji_zoom");
   } else {
-    shared_config.set_option_string("animation_search_provider", animation_search_provider);
+    options.set_option_integer("animated_emoji_zoom", static_cast<int64>(animated_emoji_zoom * 1e9));
+  }
+  if (animation_search_provider.empty()) {
+    options.set_option_empty("animation_search_provider");
+  } else {
+    options.set_option_string("animation_search_provider", animation_search_provider);
   }
   if (animation_search_emojis.empty()) {
-    shared_config.set_option_empty("animation_search_emojis");
+    options.set_option_empty("animation_search_emojis");
   } else {
-    shared_config.set_option_string("animation_search_emojis", animation_search_emojis);
+    options.set_option_string("animation_search_emojis", animation_search_emojis);
+  }
+  if (!can_archive_and_mute_new_chats_from_unknown_users) {
+    options.set_option_empty("can_archive_and_mute_new_chats_from_unknown_users");
+  } else {
+    options.set_option_boolean("can_archive_and_mute_new_chats_from_unknown_users",
+                               can_archive_and_mute_new_chats_from_unknown_users);
+  }
+  if (chat_read_mark_expire_period <= 0) {
+    options.set_option_empty("chat_read_mark_expire_period");
+  } else {
+    options.set_option_integer("chat_read_mark_expire_period", chat_read_mark_expire_period);
+  }
+  if (chat_read_mark_size_threshold <= 0) {
+    options.set_option_empty("chat_read_mark_size_threshold");
+  } else {
+    options.set_option_integer("chat_read_mark_size_threshold", chat_read_mark_size_threshold);
+  }
+  if (reactions_uniq_max <= 0 || reactions_uniq_max == 11) {
+    options.set_option_empty("reactions_uniq_max");
+  } else {
+    options.set_option_integer("reactions_uniq_max", reactions_uniq_max);
+  }
+  if (telegram_antispam_group_size_min >= 0) {
+    options.set_option_integer("aggressive_anti_spam_supergroup_member_count_min", telegram_antispam_group_size_min);
+  }
+  if (dialog_filter_update_period > 0) {
+    options.set_option_integer("chat_folder_new_chats_update_period", dialog_filter_update_period);
   }
 
-  shared_config.set_option_empty("default_ton_blockchain_config");
-  shared_config.set_option_empty("default_ton_blockchain_name");
+  if (!is_premium_available) {
+    premium_bot_username.clear();  // just in case
+    premium_invoice_slug.clear();  // just in case
+    premium_features.clear();      // just in case
+    options.set_option_empty("is_premium_available");
+  } else {
+    options.set_option_boolean("is_premium_available", is_premium_available);
+  }
+  options.set_option_string("premium_features", implode(premium_features, ','));
+  if (premium_bot_username.empty()) {
+    options.set_option_empty("premium_bot_username");
+  } else {
+    options.set_option_string("premium_bot_username", premium_bot_username);
+  }
+  if (premium_invoice_slug.empty()) {
+    options.set_option_empty("premium_invoice_slug");
+  } else {
+    options.set_option_string("premium_invoice_slug", premium_invoice_slug);
+  }
+  if (topics_pinned_limit >= 0) {
+    options.set_option_integer("pinned_forum_topic_count_max", topics_pinned_limit);
+  } else {
+    options.set_option_empty("pinned_forum_topic_count_max");
+  }
+
+  if (premium_gift_attach_menu_icon) {
+    options.set_option_boolean("gift_premium_from_attachment_menu", premium_gift_attach_menu_icon);
+  } else {
+    options.set_option_empty("gift_premium_from_attachment_menu");
+  }
+  if (premium_gift_text_field_icon) {
+    options.set_option_boolean("gift_premium_from_input_field", premium_gift_text_field_icon);
+  } else {
+    options.set_option_empty("gift_premium_from_input_field");
+  }
+  if (stories_changelog_user_id != ContactsManager::get_service_notifications_user_id().get()) {
+    options.set_option_integer("stories_changelog_user_id", stories_changelog_user_id);
+  } else {
+    options.set_option_empty("stories_changelog_user_id");
+  }
+
+  if (story_viewers_expire_period >= 0) {
+    options.set_option_integer("story_viewers_expiration_delay", story_viewers_expire_period);
+  }
+
+  if (!options.get_option_boolean("need_synchronize_archive_all_stories")) {
+    // options.set_option_boolean("archive_all_stories", archive_all_stories);
+  }
+  options.set_option_empty("archive_all_stories");
+
+  options.set_option_integer("stickers_premium_by_emoji_num", stickers_premium_by_emoji_num);
+  options.set_option_integer("stickers_normal_by_emoji_per_premium_num", stickers_normal_by_emoji_per_premium_num);
+
+  options.set_option_empty("default_ton_blockchain_config");
+  options.set_option_empty("default_ton_blockchain_name");
+  options.set_option_empty("story_viewers_expire_period");
 
   // do not update suggested actions while changing content settings or dismissing an action
   if (!is_set_content_settings_request_sent_ && dismiss_suggested_action_request_count_ == 0) {
-    std::sort(suggested_actions.begin(), suggested_actions.end());
-    suggested_actions.erase(std::unique(suggested_actions.begin(), suggested_actions.end()), suggested_actions.end());
-    if (suggested_actions != suggested_actions_) {
-      vector<SuggestedAction> added_actions;
-      vector<SuggestedAction> removed_actions;
-      auto old_it = suggested_actions_.begin();
-      auto new_it = suggested_actions.begin();
-      while (old_it != suggested_actions_.end() || new_it != suggested_actions.end()) {
-        if (old_it != suggested_actions_.end() &&
-            (new_it == suggested_actions.end() || std::less<SuggestedAction>()(*old_it, *new_it))) {
-          removed_actions.push_back(*old_it++);
-        } else if (old_it == suggested_actions_.end() || std::less<SuggestedAction>()(*new_it, *old_it)) {
-          added_actions.push_back(*new_it++);
-        } else {
-          old_it++;
-          new_it++;
-        }
-      }
-      CHECK(!added_actions.empty() || !removed_actions.empty());
-      suggested_actions_ = std::move(suggested_actions);
-      send_closure(G()->td(), &Td::send_update,
-                   get_update_suggested_actions(std::move(added_actions), std::move(removed_actions)));
-    }
+    update_suggested_actions(suggested_actions_, std::move(suggested_actions));
   }
 }
 
 void ConfigManager::get_current_state(vector<td_api::object_ptr<td_api::Update>> &updates) const {
   if (!suggested_actions_.empty()) {
-    updates.push_back(get_update_suggested_actions(suggested_actions_, {}));
+    updates.push_back(get_update_suggested_actions_object(suggested_actions_, {}, "get_current_state"));
   }
 }
+
+constexpr uint64 ConfigManager::REFCNT_TOKEN;
 
 }  // namespace td

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -74,7 +74,8 @@ class BufferAllocator {
  private:
   friend class BufferSlice;
 
-  static void track_buffer_slice(int64 size);
+  static void track_buffer_slice(int64 size) {
+  }
 
   static ReaderPtr create_reader_fast(size_t size);
 
@@ -116,12 +117,12 @@ class BufferSlice {
       : buffer_(std::move(buffer_ptr)), begin_(begin), end_(end) {
     debug_track();
   }
-  BufferSlice(const BufferSlice &other) = delete;
-  BufferSlice &operator=(const BufferSlice &other) = delete;
-  BufferSlice(BufferSlice &&other) : BufferSlice(std::move(other.buffer_), other.begin_, other.end_) {
+  BufferSlice(const BufferSlice &) = delete;
+  BufferSlice &operator=(const BufferSlice &) = delete;
+  BufferSlice(BufferSlice &&other) noexcept : BufferSlice(std::move(other.buffer_), other.begin_, other.end_) {
     debug_untrack();  // yes, debug_untrack
   }
-  BufferSlice &operator=(BufferSlice &&other) {
+  BufferSlice &operator=(BufferSlice &&other) noexcept {
     if (this == &other) {
       return *this;
     }
@@ -140,7 +141,7 @@ class BufferSlice {
   }
 
   explicit BufferSlice(Slice slice) : BufferSlice(slice.size()) {
-    as_slice().copy_from(slice);
+    as_mutable_slice().copy_from(slice);
   }
 
   BufferSlice(const char *ptr, size_t size) : BufferSlice(Slice(ptr, size)) {
@@ -182,7 +183,7 @@ class BufferSlice {
     return as_slice();
   }
 
-  MutableSlice as_slice() {
+  MutableSlice as_mutable_slice() {
     if (is_null()) {
       return MutableSlice();
     }
@@ -229,7 +230,7 @@ class BufferSlice {
 
   // like in std::string
   char *data() {
-    return as_slice().data();
+    return as_mutable_slice().data();
   }
   const char *data() const {
     return as_slice().data();
@@ -304,7 +305,7 @@ class BufferWriter {
   }
   BufferWriter(Slice slice, size_t prepend, size_t append)
       : BufferWriter(BufferAllocator::create_writer(slice.size(), prepend, append)) {
-    as_slice().copy_from(slice);
+    as_mutable_slice().copy_from(slice);
   }
   explicit BufferWriter(BufferWriterPtr buffer_ptr) : buffer_(std::move(buffer_ptr)) {
   }
@@ -324,7 +325,7 @@ class BufferWriter {
     }
     return buffer_->end_.load(std::memory_order_relaxed) - buffer_->begin_;
   }
-  MutableSlice as_slice() {
+  MutableSlice as_mutable_slice() {
     auto end = buffer_->end_.load(std::memory_order_relaxed);
     return MutableSlice(buffer_->data_ + buffer_->begin_, buffer_->data_ + end);
   }
@@ -610,10 +611,7 @@ class ChainBufferReader {
     begin_.confirm_read(size);
   }
 
-  size_t advance(size_t offset, MutableSlice dest = MutableSlice()) {
-    CHECK(offset <= size());
-    return begin_.advance(offset, dest);
-  }
+  size_t advance(size_t offset, MutableSlice dest = MutableSlice());
 
   size_t size() const {
     return end_.offset() - begin_.offset();
@@ -659,7 +657,7 @@ class ChainBufferReader {
     } else {
       auto save_size = size();
       res = BufferSlice{save_size};
-      advance(save_size, res.as_slice());
+      advance(save_size, res.as_mutable_slice());
     }
     *this = ChainBufferReader();
     return res;
@@ -680,14 +678,10 @@ class ChainBufferReader {
 
 class ChainBufferWriter {
  public:
-  ChainBufferWriter() {
-    init();
-  }
-
-  void init(size_t size = 0) {
-    writer_ = BufferWriter(size);
-    tail_ = ChainBufferNodeAllocator::create(writer_.as_buffer_slice(), true);
-    head_ = ChainBufferNodeAllocator::clone(tail_);
+  ChainBufferWriter()
+      : writer_(0)
+      , tail_(ChainBufferNodeAllocator::create(writer_.as_buffer_slice(), true))
+      , head_(ChainBufferNodeAllocator::clone(tail_)) {
   }
 
   MutableSlice prepare_append(size_t hint = 0) {
@@ -772,9 +766,9 @@ class ChainBufferWriter {
     return !tail_;
   }
 
-  ChainBufferNodeReaderPtr head_;
-  ChainBufferNodeWriterPtr tail_;
   BufferWriter writer_;
+  ChainBufferNodeWriterPtr tail_;
+  ChainBufferNodeReaderPtr head_;
 };
 
 class BufferBuilder {
@@ -834,11 +828,9 @@ class BufferBuilder {
 inline Slice as_slice(const BufferSlice &value) {
   return value.as_slice();
 }
-inline MutableSlice as_slice(BufferSlice &value) {
-  return value.as_slice();
-}
+
 inline MutableSlice as_mutable_slice(BufferSlice &value) {
-  return value.as_slice();
+  return value.as_mutable_slice();
 }
 
 }  // namespace td

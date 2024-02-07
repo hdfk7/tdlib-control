@@ -6,6 +6,15 @@ abstract class TlDocumentationGenerator
     private $documentation = array();
     private $line_replacement = array();
 
+    private function isBuiltInType($type)
+    {
+        if (in_array($type, array('Bool', 'int32', 'int53', 'int64', 'double', 'string', 'bytes'))) {
+          return true;
+        }
+        return substr($type, 0, 7) === 'vector<' && substr($type, -1, 1) === '>' && $this->isBuiltInType(substr($type, 7, -1));
+    }
+
+
     final protected function printError($error)
     {
         fwrite(STDERR, "$error near line \"".rtrim($this->current_line)."\"\n");
@@ -33,6 +42,15 @@ abstract class TlDocumentationGenerator
             return '';
         }
 
+        $brackets = preg_replace("/[^[\\](){}'\"]/", '', preg_replace("/[a-z]'/", '', $str));
+        while (strlen($brackets)) {
+            $brackets = preg_replace(array('/[[]]/', '/[(][)]/', '/[{][}]/', "/''/", '/""/'), '', $brackets, -1, $replaced_bracket_count);
+            if ($replaced_bracket_count == 0) {
+                $this->printError('Unmatched bracket in '.$str);
+                break;
+            }
+        }
+
         $len = strlen($str);
         if ($str[$len - 1] === '.') {
             return $str;
@@ -53,11 +71,11 @@ abstract class TlDocumentationGenerator
                 }
             }
             if ($bracket_count === 0) {
-                if (ctype_upper($str[$pos + 1])) {
+                if (ord('A') <= ord($str[$pos + 1]) && ord($str[$pos + 1]) <= ord('Z')) {
                     return substr($str, 0, -1).'.)';
                 }
             } else {
-                $this->printError("Unmatched bracket");
+                $this->printError('Unmatched bracket');
             }
         }
         return $str.'.';
@@ -89,7 +107,7 @@ abstract class TlDocumentationGenerator
 
     abstract protected function getFunctionReturnTypeDescription($return_type, $for_constructor);
 
-    abstract protected function addClassDocumentation($class_name, $base_class_name, $description);
+    abstract protected function addClassDocumentation($class_name, $base_class_name, $return_type, $description);
 
     abstract protected function addFieldDocumentation($class_name, $field_name, $type_name, $field_info, $may_be_null);
 
@@ -101,6 +119,7 @@ abstract class TlDocumentationGenerator
     {
         $lines = array_filter(array_map('trim', file($tl_scheme_file)));
         $description = '';
+        $description_line_count = 0;
         $current_class = '';
         $is_function = false;
         $need_class_description = false;
@@ -120,8 +139,16 @@ abstract class TlDocumentationGenerator
                     $this->printError('Wrong comment');
                     continue;
                 }
-                if ($line[2] === '@' || $line[2] === '-') {
-                    $description .= trim(substr($line, 2 + intval($line[2] === '-'))).' ';
+                if ($line[2] === '@') {
+                    if (substr($line, 2, 7) !== '@class ') {
+                      $description_line_count++;
+                    }
+                    $description .= trim(substr($line, 2)).' ';
+                } elseif ($line[2] === '-') {
+                    if (strpos($line, '@') !== false) {
+                      $description_line_count += 100;
+                    }
+                    $description .= trim(substr($line, 3)).' ';
                 } else {
                     $this->printError('Unexpected comment');
                 }
@@ -212,49 +239,61 @@ abstract class TlDocumentationGenerator
                         $known_fields[$field_name] = $field_type;
                         continue;
                     }
-                    $this->printError("Have no info about field `$field_name`");
+                    $this->printError("Have no documentation for field `$field_name`");
                 }
 
                 foreach ($info as $name => $value) {
                     if (!$value) {
-                        $this->printError("info[$name] for $class_name is empty");
+                        $this->printError("Documentation for field $name of $class_name is empty");
                     } elseif (($value[0] < 'A' || $value[0] > 'Z') && ($value[0] < '0' || $value[0] > '9')) {
-                        $this->printError("info[$name] for $class_name doesn't begins with capital letter");
+                        $this->printError("Documentation for field $name of $class_name doesn't begin with a capital letter");
                     }
-                }
-
-                foreach (array_diff_key($info, $known_fields) as $field_name => $field_info) {
-                    if ($field_name !== 'description') {
-                        $this->printError("Have info about unexisted field `$field_name`");
-                    }
-                }
-
-                if (!$info['description']) {
-                    $this->printError("Have no description for class `$class_name`");
                 }
 
                 foreach ($info as &$v) {
                     $v = $this->escapeDocumentation($this->addDot($v));
                 }
 
-                $base_class_name = $current_class ?: $this->getBaseClassName($is_function);
-                $class_description = $info['description'];
-                if ($is_function) {
-                    $class_description .= $this->getFunctionReturnTypeDescription($this->getTypeName($type), false);
+                $description = $info['description'];
+                unset($info['description']);
+
+                if (!$description) {
+                    $this->printError("Have no description for class `$class_name`");
                 }
-                $this->addClassDocumentation($class_name, $base_class_name, $class_description);
+
+                foreach (array_diff_key($info, $known_fields) as $field_name => $field_info) {
+                    $this->printError("Have info about nonexistent field `$field_name`");
+                }
+
+                if (array_keys($info) !== array_keys($known_fields)) {
+                    $this->printError("Have wrong documentation for class `$class_name`");
+                } else if ($description_line_count === 1 ? count($known_fields) >= 4 : $description_line_count !== count($known_fields) + 1) {
+                    $this->printError("Documentation for fields of class `$class_name` must be split to different lines");
+                }
+
+                $base_class_name = $current_class ?: $this->getBaseClassName($is_function);
+                $class_description = $description;
+                $return_type = "";
+                if ($is_function) {
+                    $return_type = $this->getTypeName($type);
+                    $class_description .= $this->getFunctionReturnTypeDescription($return_type, false);
+                }
+                $this->addClassDocumentation($class_name, $base_class_name, $return_type, $class_description);
 
                 foreach ($known_fields as $name => $field_type) {
                     $may_be_null = stripos($info[$name], 'may be null') !== false;
                     $field_name = $this->getFieldName($name, $class_name);
                     $field_type_name = $this->getTypeName($field_type);
+                    if ($this->isBuiltInType($field_type) && ($may_be_null || stripos($info[$name], '; pass null') !== false)) {
+                        $this->printError("Field `$name` of class `$class_name` can't be marked as nullable");
+                    }
                     $this->addFieldDocumentation($class_name, $field_name, $field_type_name, $info[$name], $may_be_null);
                 }
 
                 if ($is_function) {
                     $default_constructor_prefix = 'Default constructor for a function, which ';
                     $full_constructor_prefix = 'Creates a function, which ';
-                    $class_description = lcfirst($info['description']);
+                    $class_description = lcfirst($description);
                     $class_description .= $this->getFunctionReturnTypeDescription($this->getTypeName($type), true);
                 } else {
                     $default_constructor_prefix = '';
@@ -267,6 +306,7 @@ abstract class TlDocumentationGenerator
                 }
 
                 $description = '';
+                $description_line_count = 0;
             }
         }
 

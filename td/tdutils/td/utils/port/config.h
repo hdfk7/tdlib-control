@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -34,16 +34,22 @@
 #elif TD_WINDOWS
   #define TD_POLL_WINEVENT 1
   #define TD_EVENTFD_WINDOWS 1
+#elif TD_ILLUMOS
+  #define TD_POLL_EPOLL 1
+  #define TD_EVENTFD_LINUX 1
+#elif TD_SOLARIS
+  #define TD_POLL_POLL 1
+  #define TD_EVENTFD_BSD 1
 #else
   #error "Poll's implementation is not defined"
 #endif
 
 #if TD_EMSCRIPTEN
   #define TD_THREAD_UNSUPPORTED 1
-#elif TD_TIZEN || TD_LINUX || TD_DARWIN
-  #define TD_THREAD_PTHREAD 1
-#else
+#elif TD_WINDOWS
   #define TD_THREAD_STL 1
+#else
+  #define TD_THREAD_PTHREAD 1
 #endif
 
 #if TD_LINUX

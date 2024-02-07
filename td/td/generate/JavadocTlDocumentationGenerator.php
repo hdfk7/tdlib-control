@@ -15,7 +15,7 @@ class JavadocTlDocumentationGenerator extends TlDocumentationGenerator
             {
                 return preg_replace_callback('/_([A-Za-z])/', function ($matches) {return strtoupper($matches[1]);}, $word_matches[0]);
             }, $doc);
-        $doc = htmlspecialchars($doc);
+        $doc = htmlspecialchars($doc, ENT_COMPAT, 'UTF-8');
         $doc = str_replace('*/', '*&#47;', $doc);
         return $doc;
     }
@@ -104,7 +104,7 @@ class JavadocTlDocumentationGenerator extends TlDocumentationGenerator
     protected function extractClassName($line)
     {
         if (strpos($line, 'public static class ') > 0) {
-            return explode(' ', trim($line))[3];
+            return preg_split('/( |<|>)/', trim($line))[3];
         }
         return '';
     }
@@ -143,24 +143,44 @@ EOT
 EOT
 );
 
+        $this->addDocumentation("        public Object() {", <<<EOT
+        /**
+         * Default Object constructor.
+         */
+EOT
+);
+
         $this->addDocumentation('        public abstract int getConstructor();', <<<EOT
         /**
-         * @return identifier uniquely determining type of the object.
+         * Returns an identifier uniquely determining type of the object.
+         *
+         * @return a unique identifier of the object type.
          */
 EOT
 );
 
         $this->addDocumentation('        public native String toString();', <<<EOT
         /**
-         * @return string representation of the object.
+         * Returns a string representation of the object.
+         *
+         * @return a string representation of the object.
          */
 EOT
 );
 
-        $this->addDocumentation('    public abstract static class Function extends Object {', <<<EOT
+        $this->addDocumentation('    public abstract static class Function<R extends Object> extends Object {', <<<EOT
     /**
      * This class is a base class for all TDLib interface function-classes.
+     *
+     * @param <R> The object type that is returned by the function
      */
+EOT
+);
+
+        $this->addDocumentation("        public Function() {", <<<EOT
+        /**
+         * Default Function constructor.
+         */
 EOT
 );
 
@@ -188,6 +208,12 @@ EOT
      */
 EOT
 );
+        $this->addDocumentation("        public $class_name() {", <<<EOT
+        /**
+         * Default class constructor.
+         */
+EOT
+);
     }
 
     protected function getFunctionReturnTypeDescription($return_type, $for_constructor)
@@ -196,9 +222,9 @@ EOT
         return PHP_EOL.$shift.'*'.PHP_EOL.$shift."* <p> Returns {@link $return_type $return_type} </p>";
     }
 
-    protected function addClassDocumentation($class_name, $base_class_name, $description)
+    protected function addClassDocumentation($class_name, $base_class_name, $return_type, $description)
     {
-        $this->addDocumentation("    public static class $class_name extends $base_class_name {", <<<EOT
+        $this->addDocumentation("    public static class $class_name extends ".$base_class_name.(empty($return_type) ? "" : "<".$return_type.">")." {", <<<EOT
     /**
      * $description
      */

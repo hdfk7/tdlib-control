@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -20,19 +20,22 @@ class TD_TL_writer_h : public TD_TL_writer {
 
   static std::string forward_declaration(std::string type);
 
+  bool need_arg_mask(const tl::arg &a, bool can_be_stored) const;
+
  public:
   TD_TL_writer_h(const std::string &tl_name, const std::string &string_type, const std::string &bytes_type,
                  const std::vector<std::string> &ext_include)
       : TD_TL_writer(tl_name, string_type, bytes_type), ext_include(ext_include) {
   }
 
-  std::string gen_output_begin() const override;
+  std::string gen_output_begin(const std::string &additional_imports) const override;
+  std::string gen_output_begin_once() const override;
   std::string gen_output_end() const override;
 
   std::string gen_forward_class_declaration(const std::string &class_name, bool is_proxy) const override;
 
-  std::string gen_class_begin(const std::string &class_name, const std::string &base_class_name,
-                              bool is_proxy) const override;
+  std::string gen_class_begin(const std::string &class_name, const std::string &base_class_name, bool is_proxy,
+                              const tl::tl_tree *result) const override;
   std::string gen_class_end() const override;
 
   std::string gen_class_alias(const std::string &class_name, const std::string &alias_name) const override;
@@ -40,7 +43,7 @@ class TD_TL_writer_h : public TD_TL_writer {
   std::string gen_field_definition(const std::string &class_name, const std::string &type_name,
                                    const std::string &field_name) const override;
 
-  std::string gen_flags_definitions(const tl::tl_combinator *t) const override;
+  std::string gen_flags_definitions(const tl::tl_combinator *t, bool can_be_stored) const override;
   std::string gen_vars(const tl::tl_combinator *t, const tl::tl_tree_type *result_type,
                        std::vector<tl::var_description> &vars) const override;
   std::string gen_function_vars(const tl::tl_combinator *t, std::vector<tl::var_description> &vars) const override;

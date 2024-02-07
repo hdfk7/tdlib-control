@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -55,12 +55,12 @@ class JvmThreadDetacher {
   explicit JvmThreadDetacher(JavaVM *java_vm) : java_vm_(java_vm) {
   }
 
-  JvmThreadDetacher(const JvmThreadDetacher &other) = delete;
-  JvmThreadDetacher &operator=(const JvmThreadDetacher &other) = delete;
+  JvmThreadDetacher(const JvmThreadDetacher &) = delete;
+  JvmThreadDetacher &operator=(const JvmThreadDetacher &) = delete;
   JvmThreadDetacher(JvmThreadDetacher &&other) : java_vm_(other.java_vm_) {
     other.java_vm_ = nullptr;
   }
-  JvmThreadDetacher &operator=(JvmThreadDetacher &&other) = delete;
+  JvmThreadDetacher &operator=(JvmThreadDetacher &&) = delete;
   ~JvmThreadDetacher() {
     detach();
   }
@@ -107,7 +107,8 @@ jobjectArray store_vector(JNIEnv *env, const std::vector<std::string> &v);
 
 template <class T>
 jobjectArray store_vector(JNIEnv *env, const std::vector<T> &v) {
-  jint length = static_cast<jint>(v.size());
+  auto length = static_cast<jint>(v.size());
+  T::element_type::init_jni_vars(env);
   jobjectArray arr = env->NewObjectArray(length, T::element_type::Class, jobject());
   if (arr != nullptr) {
     for (jint i = 0; i < length; i++) {
@@ -155,7 +156,7 @@ class get_array_class<td_api::pageBlockTableCell> {
 
 template <class T>
 jobjectArray store_vector(JNIEnv *env, const std::vector<std::vector<T>> &v) {
-  jint length = static_cast<jint>(v.size());
+  auto length = static_cast<jint>(v.size());
   jobjectArray arr = env->NewObjectArray(length, get_array_class<typename T::element_type>::get(), 0);
   if (arr != nullptr) {
     for (jint i = 0; i < length; i++) {

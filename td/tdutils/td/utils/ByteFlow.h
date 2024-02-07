@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -25,6 +25,7 @@ class ByteFlowInterface {
   virtual size_t get_write_size() = 0;
   virtual void reset_need_size() {
   }
+
   ByteFlowInterface() = default;
   ByteFlowInterface(const ByteFlowInterface &) = delete;
   ByteFlowInterface &operator=(const ByteFlowInterface &) = delete;
@@ -139,6 +140,7 @@ class ByteFlowBaseCommon : public ByteFlowInterface {
   bool can_read{true};
   bool can_write{true};
   Options options_;
+
   void finish(Status status) {
     stop_flag_ = true;
     need_size_ = 0;
@@ -220,16 +222,16 @@ inline ByteFlowInterface &operator>>(ByteFlowInterface &from, ByteFlowInterface 
   return to;
 }
 
-class ByteFlowSource : public ByteFlowInterface {
+class ByteFlowSource final : public ByteFlowInterface {
  public:
   ByteFlowSource() = default;
   explicit ByteFlowSource(ChainBufferReader *buffer) : buffer_(buffer) {
   }
-  ByteFlowSource(ByteFlowSource &&other) : buffer_(other.buffer_), parent_(other.parent_) {
+  ByteFlowSource(ByteFlowSource &&other) noexcept : buffer_(other.buffer_), parent_(other.parent_) {
     other.buffer_ = nullptr;
     other.parent_ = nullptr;
   }
-  ByteFlowSource &operator=(ByteFlowSource &&other) {
+  ByteFlowSource &operator=(ByteFlowSource &&other) noexcept {
     buffer_ = other.buffer_;
     parent_ = other.parent_;
     other.buffer_ = nullptr;
@@ -279,7 +281,7 @@ class ByteFlowSource : public ByteFlowInterface {
   ByteFlowInterface *parent_ = nullptr;
 };
 
-class ByteFlowSink : public ByteFlowInterface {
+class ByteFlowSink final : public ByteFlowInterface {
  public:
   void set_input(ChainBufferReader *input) final {
     CHECK(buffer_ == nullptr);
@@ -329,7 +331,7 @@ class ByteFlowSink : public ByteFlowInterface {
   ChainBufferReader *buffer_ = nullptr;
 };
 
-class ByteFlowMoveSink : public ByteFlowInterface {
+class ByteFlowMoveSink final : public ByteFlowInterface {
  public:
   ByteFlowMoveSink() = default;
   explicit ByteFlowMoveSink(ChainBufferWriter *output) {

@@ -1,10 +1,13 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/files/FileType.h"
+
+#include "td/utils/misc.h"
+#include "td/utils/PathView.h"
 
 namespace td {
 
@@ -16,10 +19,14 @@ FileType get_file_type(const td_api::FileType &file_type) {
       return FileType::ProfilePhoto;
     case td_api::fileTypePhoto::ID:
       return FileType::Photo;
+    case td_api::fileTypePhotoStory::ID:
+      return FileType::PhotoStory;
     case td_api::fileTypeVoiceNote::ID:
       return FileType::VoiceNote;
     case td_api::fileTypeVideo::ID:
       return FileType::Video;
+    case td_api::fileTypeVideoStory::ID:
+      return FileType::VideoStory;
     case td_api::fileTypeDocument::ID:
       return FileType::Document;
     case td_api::fileTypeSecret::ID:
@@ -39,7 +46,9 @@ FileType get_file_type(const td_api::FileType &file_type) {
     case td_api::fileTypeVideoNote::ID:
       return FileType::VideoNote;
     case td_api::fileTypeSecure::ID:
-      return FileType::Secure;
+      return FileType::SecureEncrypted;
+    case td_api::fileTypeNotificationSound::ID:
+      return FileType::Ringtone;
     case td_api::fileTypeNone::ID:
       return FileType::None;
     default:
@@ -78,15 +87,23 @@ tl_object_ptr<td_api::FileType> get_file_type_object(FileType file_type) {
       return make_tl_object<td_api::fileTypeWallpaper>();
     case FileType::VideoNote:
       return make_tl_object<td_api::fileTypeVideoNote>();
-    case FileType::Secure:
+    case FileType::SecureEncrypted:
       return make_tl_object<td_api::fileTypeSecure>();
-    case FileType::SecureRaw:
+    case FileType::SecureDecrypted:
       UNREACHABLE();
       return make_tl_object<td_api::fileTypeSecure>();
     case FileType::Background:
       return make_tl_object<td_api::fileTypeWallpaper>();
     case FileType::DocumentAsFile:
       return make_tl_object<td_api::fileTypeDocument>();
+    case FileType::Ringtone:
+      return make_tl_object<td_api::fileTypeNotificationSound>();
+    case FileType::CallLog:
+      return make_tl_object<td_api::fileTypeDocument>();
+    case FileType::PhotoStory:
+      return make_tl_object<td_api::fileTypePhotoStory>();
+    case FileType::VideoStory:
+      return make_tl_object<td_api::fileTypeVideoStory>();
     case FileType::None:
       return make_tl_object<td_api::fileTypeNone>();
     default:
@@ -99,9 +116,11 @@ FileType get_main_file_type(FileType file_type) {
   switch (file_type) {
     case FileType::Wallpaper:
       return FileType::Background;
-    case FileType::SecureRaw:
-      return FileType::Secure;
+    case FileType::SecureDecrypted:
+      return FileType::SecureEncrypted;
     case FileType::DocumentAsFile:
+      return FileType::Document;
+    case FileType::CallLog:
       return FileType::Document;
     default:
       return file_type;
@@ -109,7 +128,7 @@ FileType get_main_file_type(FileType file_type) {
 }
 
 CSlice get_file_type_name(FileType file_type) {
-  switch (file_type) {
+  switch (get_main_file_type(file_type)) {
     case FileType::Thumbnail:
       return CSlice("thumbnails");
     case FileType::ProfilePhoto:
@@ -134,28 +153,123 @@ CSlice get_file_type_name(FileType file_type) {
       return CSlice("animations");
     case FileType::EncryptedThumbnail:
       return CSlice("secret_thumbnails");
-    case FileType::Wallpaper:
-      return CSlice("wallpapers");
     case FileType::VideoNote:
       return CSlice("video_notes");
-    case FileType::SecureRaw:
-      return CSlice("passport");
-    case FileType::Secure:
+    case FileType::SecureEncrypted:
       return CSlice("passport");
     case FileType::Background:
       return CSlice("wallpapers");
-    case FileType::DocumentAsFile:
-      return CSlice("documents");
-    case FileType::Size:
-    case FileType::None:
+    case FileType::Ringtone:
+      return CSlice("notification_sounds");
+    case FileType::PhotoStory:
+      return CSlice("stories");
+    case FileType::VideoStory:
+      return CSlice("stories");
     default:
       UNREACHABLE();
       return CSlice("none");
   }
 }
 
+CSlice get_file_type_unique_name(FileType file_type) {
+  if (file_type == FileType::VideoStory) {
+    return CSlice("video_stories");
+  }
+  return get_file_type_name(file_type);
+}
+
+FileTypeClass get_file_type_class(FileType file_type) {
+  switch (file_type) {
+    case FileType::Photo:
+    case FileType::ProfilePhoto:
+    case FileType::Thumbnail:
+    case FileType::EncryptedThumbnail:
+    case FileType::Wallpaper:
+    case FileType::PhotoStory:
+      return FileTypeClass::Photo;
+    case FileType::Video:
+    case FileType::VoiceNote:
+    case FileType::Document:
+    case FileType::Sticker:
+    case FileType::Audio:
+    case FileType::Animation:
+    case FileType::VideoNote:
+    case FileType::Background:
+    case FileType::DocumentAsFile:
+    case FileType::Ringtone:
+    case FileType::CallLog:
+    case FileType::VideoStory:
+      return FileTypeClass::Document;
+    case FileType::SecureDecrypted:
+    case FileType::SecureEncrypted:
+      return FileTypeClass::Secure;
+    case FileType::Encrypted:
+      return FileTypeClass::Encrypted;
+    case FileType::Temp:
+      return FileTypeClass::Temp;
+    case FileType::None:
+    case FileType::Size:
+    default:
+      UNREACHABLE();
+      return FileTypeClass::Temp;
+  }
+}
+
+bool is_document_file_type(FileType file_type) {
+  return get_file_type_class(file_type) == FileTypeClass::Document;
+}
+
 StringBuilder &operator<<(StringBuilder &string_builder, FileType file_type) {
-  return string_builder << get_file_type_name(file_type);
+  switch (file_type) {
+    case FileType::Thumbnail:
+      return string_builder << "Thumbnail";
+    case FileType::ProfilePhoto:
+      return string_builder << "ChatPhoto";
+    case FileType::Photo:
+      return string_builder << "Photo";
+    case FileType::VoiceNote:
+      return string_builder << "VoiceNote";
+    case FileType::Video:
+      return string_builder << "Video";
+    case FileType::Document:
+      return string_builder << "Document";
+    case FileType::Encrypted:
+      return string_builder << "Secret";
+    case FileType::Temp:
+      return string_builder << "Temp";
+    case FileType::Sticker:
+      return string_builder << "Sticker";
+    case FileType::Audio:
+      return string_builder << "Audio";
+    case FileType::Animation:
+      return string_builder << "Animation";
+    case FileType::EncryptedThumbnail:
+      return string_builder << "SecretThumbnail";
+    case FileType::Wallpaper:
+      return string_builder << "Wallpaper";
+    case FileType::VideoNote:
+      return string_builder << "VideoNote";
+    case FileType::SecureDecrypted:
+      return string_builder << "Passport";
+    case FileType::SecureEncrypted:
+      return string_builder << "Passport";
+    case FileType::Background:
+      return string_builder << "Background";
+    case FileType::DocumentAsFile:
+      return string_builder << "DocumentAsFile";
+    case FileType::Ringtone:
+      return string_builder << "NotificationSound";
+    case FileType::CallLog:
+      return string_builder << "CallLog";
+    case FileType::PhotoStory:
+      return string_builder << "PhotoStory";
+    case FileType::VideoStory:
+      return string_builder << "VideoStory";
+    case FileType::Size:
+    case FileType::None:
+    default:
+      return string_builder << "<invalid>";
+  }
 }
 
 FileDirType get_file_dir_type(FileType file_type) {
@@ -167,9 +281,12 @@ FileDirType get_file_dir_type(FileType file_type) {
     case FileType::Temp:
     case FileType::Wallpaper:
     case FileType::EncryptedThumbnail:
-    case FileType::Secure:
-    case FileType::SecureRaw:
+    case FileType::SecureEncrypted:
+    case FileType::SecureDecrypted:
     case FileType::Background:
+    case FileType::Ringtone:
+    case FileType::PhotoStory:
+    case FileType::VideoStory:
       return FileDirType::Secure;
     default:
       return FileDirType::Common;
@@ -177,11 +294,14 @@ FileDirType get_file_dir_type(FileType file_type) {
 }
 
 bool is_file_big(FileType file_type, int64 expected_size) {
+  if (get_file_type_class(file_type) == FileTypeClass::Photo) {
+    return false;
+  }
   switch (file_type) {
-    case FileType::Thumbnail:
-    case FileType::ProfilePhoto:
-    case FileType::Photo:
-    case FileType::EncryptedThumbnail:
+    case FileType::VideoNote:
+    case FileType::Ringtone:
+    case FileType::CallLog:
+    case FileType::VideoStory:
       return false;
     default:
       break;
@@ -189,6 +309,55 @@ bool is_file_big(FileType file_type, int64 expected_size) {
 
   constexpr int64 SMALL_FILE_MAX_SIZE = 10 << 20;
   return expected_size > SMALL_FILE_MAX_SIZE;
+}
+
+bool can_reuse_remote_file(FileType file_type) {
+  switch (file_type) {
+    case FileType::Thumbnail:
+    case FileType::EncryptedThumbnail:
+    case FileType::Background:
+    case FileType::CallLog:
+    case FileType::PhotoStory:
+    case FileType::VideoStory:
+      return false;
+    default:
+      return true;
+  }
+}
+
+FileType guess_file_type_by_path(Slice file_path, FileType default_file_type) {
+  if (default_file_type != FileType::None) {
+    if (default_file_type == FileType::PhotoStory && ends_with(file_path, ".mp4")) {
+      return FileType::VideoStory;
+    }
+    return default_file_type;
+  }
+
+  PathView path_view(file_path);
+  auto file_name = path_view.file_name();
+  auto extension = path_view.extension();
+  if (extension == "jpg" || extension == "jpeg") {
+    return FileType::Photo;
+  }
+  if (extension == "ogg" || extension == "oga" || extension == "opus") {
+    return FileType::VoiceNote;
+  }
+  if (extension == "3gp" || extension == "mov") {
+    return FileType::Video;
+  }
+  if (extension == "mp3" || extension == "mpeg3" || extension == "m4a") {
+    return FileType::Audio;
+  }
+  if (extension == "webp" || extension == "tgs" || extension == "webm") {
+    return FileType::Sticker;
+  }
+  if (extension == "gif") {
+    return FileType::Animation;
+  }
+  if (extension == "mp4" || extension == "mpeg4") {
+    return to_lower(file_name).find("-gif-") != string::npos ? FileType::Animation : FileType::Video;
+  }
+  return FileType::Document;
 }
 
 }  // namespace td

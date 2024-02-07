@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -17,22 +17,23 @@ TEST(OptionParser, run) {
   td::string exename = "exename";
   td::vector<td::string> args;
   auto run_option_parser = [&](td::string command_line) {
-    args = td::full_split(command_line, ' ');
+    args = td::full_split(std::move(command_line), ' ');
     td::vector<char *> argv;
     argv.push_back(&exename[0]);
     for (auto &arg : args) {
       argv.push_back(&arg[0]);
     }
-    return options.run(static_cast<int>(argv.size()), &argv[0]);
+    return options.run_impl(static_cast<int>(argv.size()), &argv[0], -1);
   };
 
   td::uint64 chosen_options = 0;
   td::vector<td::string> chosen_parameters;
   auto test_success = [&](td::string command_line, td::uint64 expected_options,
-                          td::vector<td::string> expected_parameters, td::vector<td::string> expected_result) {
+                          const td::vector<td::string> &expected_parameters,
+                          const td::vector<td::string> &expected_result) {
     chosen_options = 0;
     chosen_parameters.clear();
-    auto result = run_option_parser(command_line);
+    auto result = run_option_parser(std::move(command_line));
     ASSERT_TRUE(result.is_ok());
     ASSERT_EQ(expected_options, chosen_options);
     ASSERT_EQ(expected_parameters, chosen_parameters);
@@ -42,7 +43,7 @@ TEST(OptionParser, run) {
     }
   };
   auto test_fail = [&](td::string command_line) {
-    auto result = run_option_parser(command_line);
+    auto result = run_option_parser(std::move(command_line));
     ASSERT_TRUE(result.is_error());
   };
 

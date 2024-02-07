@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -7,9 +7,8 @@
 #pragma once
 
 #include "td/telegram/Global.h"
-#include "td/telegram/SecretInputMedia.h"
-
 #include "td/telegram/secret_api.h"
+#include "td/telegram/SecretInputMedia.h"
 #include "td/telegram/td_api.h"
 #include "td/telegram/telegram_api.h"
 
@@ -19,6 +18,8 @@
 #include "td/utils/tl_helpers.h"
 
 namespace td {
+
+class Td;
 
 class Location {
   bool is_empty_ = true;
@@ -32,18 +33,18 @@ class Location {
 
   friend StringBuilder &operator<<(StringBuilder &string_builder, const Location &location);
 
-  void init(double latitude, double longitude, double horizontal_accuracy, int64 access_hash);
+  void init(Td *td, double latitude, double longitude, double horizontal_accuracy, int64 access_hash);
 
-  double fix_accuracy(double accuracy);
+  static double fix_accuracy(double accuracy);
 
  public:
   Location() = default;
 
-  Location(double latitude, double longitude, double horizontal_accuracy, int64 access_hash);
+  Location(Td *td, double latitude, double longitude, double horizontal_accuracy, int64 access_hash);
 
   explicit Location(const tl_object_ptr<secret_api::decryptedMessageMediaGeoPoint> &geo_point);
 
-  explicit Location(const tl_object_ptr<telegram_api::GeoPoint> &geo_point_ptr);
+  Location(Td *td, const tl_object_ptr<telegram_api::GeoPoint> &geo_point_ptr);
 
   explicit Location(const tl_object_ptr<td_api::location> &location);
 
@@ -54,6 +55,8 @@ class Location {
   tl_object_ptr<td_api::location> get_location_object() const;
 
   tl_object_ptr<telegram_api::InputGeoPoint> get_input_geo_point() const;
+
+  telegram_api::object_ptr<telegram_api::GeoPoint> get_fake_geo_point() const;
 
   tl_object_ptr<telegram_api::inputMediaGeoPoint> get_input_media_geo_point() const;
 
@@ -127,6 +130,13 @@ struct InputMessageLocation {
   int32 live_period;
   int32 heading;
   int32 proximity_alert_radius;
+
+  InputMessageLocation(Location &&location, int32 live_period, int32 heading, int32 proximity_alert_radius)
+      : location(std::move(location))
+      , live_period(live_period)
+      , heading(heading)
+      , proximity_alert_radius(proximity_alert_radius) {
+  }
 };
 Result<InputMessageLocation> process_input_message_location(
     td_api::object_ptr<td_api::InputMessageContent> &&input_message_content) TD_WARN_UNUSED_RESULT;

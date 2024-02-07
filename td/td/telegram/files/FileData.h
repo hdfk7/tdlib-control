@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -39,9 +39,8 @@ class FileData {
 };
 
 inline StringBuilder &operator<<(StringBuilder &sb, const FileData &file_data) {
-  sb << "[" << tag("remote_name", file_data.remote_name_) << " " << file_data.owner_dialog_id_ << " "
-     << tag("size", file_data.size_) << tag("expected_size", file_data.expected_size_) << " "
-     << file_data.encryption_key_;
+  sb << "[" << tag("remote_name", file_data.remote_name_) << " " << tag("size", file_data.size_)
+     << tag("expected_size", file_data.expected_size_) << " " << file_data.encryption_key_;
   if (!file_data.url_.empty()) {
     sb << tag("url", file_data.url_);
   }
@@ -54,7 +53,7 @@ inline StringBuilder &operator<<(StringBuilder &sb, const FileData &file_data) {
   if (file_data.remote_.type() == RemoteFileLocation::Type::Full) {
     sb << " remote " << file_data.remote_.full();
   }
-  sb << format::as_array(file_data.file_source_ids_);
+  sb << ", sources = " << format::as_array(file_data.file_source_ids_);
   return sb << "]";
 }
 

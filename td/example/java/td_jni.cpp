@@ -1,11 +1,10 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include <td/telegram/Client.h>
-#include <td/telegram/Log.h>
 #include <td/telegram/td_api.h>
 
 #include <td/tl/tl_jni_object.h>
@@ -31,7 +30,7 @@ static td::ClientManager *get_manager() {
 }
 
 static jint Client_createNativeClient(JNIEnv *env, jclass clazz) {
-  return static_cast<jint>(get_manager()->create_client());
+  return static_cast<jint>(get_manager()->create_client_id());
 }
 
 static void Client_nativeClientSend(JNIEnv *env, jclass clazz, jint client_id, jlong id, jobject function) {
@@ -50,10 +49,10 @@ static jint Client_nativeClientReceive(JNIEnv *env, jclass clazz, jintArray clie
   auto *manager = get_manager();
   auto response = manager->receive(timeout);
   while (response.object) {
-    jint client_id = static_cast<jint>(response.client_id);
+    auto client_id = static_cast<jint>(response.client_id);
     env->SetIntArrayRegion(client_ids, result_size, 1, &client_id);
 
-    jlong request_id = static_cast<jlong>(response.request_id);
+    auto request_id = static_cast<jlong>(response.request_id);
     env->SetLongArrayRegion(ids, result_size, 1, &request_id);
 
     jobject object;
@@ -77,18 +76,6 @@ static jobject Client_nativeClientExecute(JNIEnv *env, jclass clazz, jobject fun
   return result;
 }
 
-static void Log_setVerbosityLevel(JNIEnv *env, jclass clazz, jint new_log_verbosity_level) {
-  td::Log::set_verbosity_level(static_cast<int>(new_log_verbosity_level));
-}
-
-static jboolean Log_setFilePath(JNIEnv *env, jclass clazz, jstring file_path) {
-  return td::Log::set_file_path(td::jni::from_jstring(env, file_path)) ? JNI_TRUE : JNI_FALSE;
-}
-
-static void Log_setMaxFileSize(JNIEnv *env, jclass clazz, jlong max_file_size) {
-  td::Log::set_max_file_size(max_file_size);
-}
-
 static jstring Object_toString(JNIEnv *env, jobject object) {
   return td::jni::to_jstring(env, to_string(td::td_api::Object::fetch(env, object)));
 }
@@ -99,20 +86,52 @@ static jstring Function_toString(JNIEnv *env, jobject object) {
 
 static constexpr jint JAVA_VERSION = JNI_VERSION_1_6;
 static JavaVM *java_vm;
-static jclass log_class;
+static jobject log_message_handler;
 
-static void on_fatal_error(const char *error_message) {
+static void on_log_message(int verbosity_level, const char *log_message) {
   auto env = td::jni::get_jni_env(java_vm, JAVA_VERSION);
   if (env == nullptr) {
     return;
   }
-  jmethodID on_fatal_error_method = env->GetStaticMethodID(log_class, "onFatalError", "(Ljava/lang/String;)V");
-  if (on_fatal_error_method) {
-    jstring error_str = td::jni::to_jstring(env.get(), error_message);
-    env->CallStaticVoidMethod(log_class, on_fatal_error_method, error_str);
-    if (error_str) {
-      env->DeleteLocalRef(error_str);
+
+  jobject handler = env->NewLocalRef(log_message_handler);
+  if (!handler) {
+    return;
+  }
+
+  jclass handler_class = env->GetObjectClass(handler);
+  if (handler_class) {
+    jmethodID on_log_message_method = env->GetMethodID(handler_class, "onLogMessage", "(ILjava/lang/String;)V");
+    if (on_log_message_method) {
+      jstring log_message_str = td::jni::to_jstring(env.get(), log_message);
+      if (log_message_str) {
+        env->CallVoidMethod(handler, on_log_message_method, static_cast<jint>(verbosity_level), log_message_str);
+        env->DeleteLocalRef((jobject)log_message_str);
+      }
     }
+    env->DeleteLocalRef((jobject)handler_class);
+  }
+
+  env->DeleteLocalRef(handler);
+}
+
+static void Client_nativeClientSetLogMessageHandler(JNIEnv *env, jclass clazz, jint max_verbosity_level,
+                                                    jobject new_log_message_handler) {
+  if (log_message_handler) {
+    td::ClientManager::set_log_message_callback(0, nullptr);
+    jobject old_log_message_handler = log_message_handler;
+    log_message_handler = jobject();
+    env->DeleteGlobalRef(old_log_message_handler);
+  }
+
+  if (new_log_message_handler) {
+    log_message_handler = env->NewGlobalRef(new_log_message_handler);
+    if (!log_message_handler) {
+      // out of memory
+      return;
+    }
+
+    td::ClientManager::set_log_message_callback(static_cast<int>(max_verbosity_level), on_log_message);
   }
 }
 
@@ -130,7 +149,6 @@ static jint register_native(JavaVM *vm) {
   };
 
   auto client_class = td::jni::get_jclass(env, PACKAGE_NAME "/Client");
-  log_class = td::jni::get_jclass(env, PACKAGE_NAME "/Log");
   auto object_class = td::jni::get_jclass(env, PACKAGE_NAME "/TdApi$Object");
   auto function_class = td::jni::get_jclass(env, PACKAGE_NAME "/TdApi$Function");
 
@@ -140,10 +158,8 @@ static jint register_native(JavaVM *vm) {
   register_method(client_class, "nativeClientSend", "(IJ" TD_FUNCTION ")V", Client_nativeClientSend);
   register_method(client_class, "nativeClientReceive", "([I[J[" TD_OBJECT "D)I", Client_nativeClientReceive);
   register_method(client_class, "nativeClientExecute", "(" TD_FUNCTION ")" TD_OBJECT, Client_nativeClientExecute);
-
-  register_method(log_class, "setVerbosityLevel", "(I)V", Log_setVerbosityLevel);
-  register_method(log_class, "setFilePath", "(Ljava/lang/String;)Z", Log_setFilePath);
-  register_method(log_class, "setMaxFileSize", "(J)V", Log_setMaxFileSize);
+  register_method(client_class, "nativeClientSetLogMessageHandler", "(IL" PACKAGE_NAME "/Client$LogMessageHandler;)V",
+                  Client_nativeClientSetLogMessageHandler);
 
   register_method(object_class, "toString", "()Ljava/lang/String;", Object_toString);
 
@@ -152,9 +168,7 @@ static jint register_native(JavaVM *vm) {
 #undef TD_OBJECT
 
   td::jni::init_vars(env, PACKAGE_NAME);
-  td::td_api::Object::init_jni_vars(env, PACKAGE_NAME);
-  td::td_api::Function::init_jni_vars(env, PACKAGE_NAME);
-  td::Log::set_fatal_error_callback(on_fatal_error);
+  td::td_api::get_package_name_ref() = PACKAGE_NAME;
 
   return JAVA_VERSION;
 }

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -7,15 +7,18 @@
 #include "td/telegram/ReplyMarkup.h"
 
 #include "td/telegram/ContactsManager.h"
+#include "td/telegram/Dependencies.h"
 #include "td/telegram/Global.h"
+#include "td/telegram/LinkManager.h"
 #include "td/telegram/misc.h"
-#include "td/telegram/Td.h"
 #include "td/telegram/td_api.h"
 #include "td/telegram/telegram_api.h"
 
+#include "td/utils/algorithm.h"
 #include "td/utils/buffer.h"
 #include "td/utils/format.h"
 #include "td/utils/logging.h"
+#include "td/utils/SliceBuilder.h"
 
 #include <limits>
 
@@ -24,9 +27,11 @@ namespace td {
 static constexpr int32 REPLY_MARKUP_FLAG_NEED_RESIZE_KEYBOARD = 1 << 0;
 static constexpr int32 REPLY_MARKUP_FLAG_IS_ONE_TIME_KEYBOARD = 1 << 1;
 static constexpr int32 REPLY_MARKUP_FLAG_IS_PERSONAL = 1 << 2;
+static constexpr int32 REPLY_MARKUP_FLAG_HAS_PLACEHOLDER = 1 << 3;
+static constexpr int32 REPLY_MARKUP_FLAG_IS_PERSISTENT = 1 << 4;
 
 static bool operator==(const KeyboardButton &lhs, const KeyboardButton &rhs) {
-  return lhs.type == rhs.type && lhs.text == rhs.text;
+  return lhs.type == rhs.type && lhs.text == rhs.text && lhs.url == rhs.url;
 }
 
 static StringBuilder &operator<<(StringBuilder &string_builder, const KeyboardButton &keyboard_button) {
@@ -49,6 +54,12 @@ static StringBuilder &operator<<(StringBuilder &string_builder, const KeyboardBu
       break;
     case KeyboardButton::Type::RequestPollRegular:
       string_builder << "RequestPollRegular";
+      break;
+    case KeyboardButton::Type::WebView:
+      string_builder << "WebApp";
+      break;
+    case KeyboardButton::Type::RequestDialog:
+      string_builder << "RequestChat";
       break;
     default:
       UNREACHABLE();
@@ -73,7 +84,7 @@ static StringBuilder &operator<<(StringBuilder &string_builder, const InlineKeyb
       string_builder << "CallbackGame";
       break;
     case InlineKeyboardButton::Type::SwitchInline:
-      string_builder << "SwitchInline";
+      string_builder << "SwitchInline, target chat mask = " << keyboard_button.id;
       break;
     case InlineKeyboardButton::Type::SwitchInlineCurrentDialog:
       string_builder << "SwitchInlineCurrentChat";
@@ -82,10 +93,16 @@ static StringBuilder &operator<<(StringBuilder &string_builder, const InlineKeyb
       string_builder << "Buy";
       break;
     case InlineKeyboardButton::Type::UrlAuth:
-      string_builder << "UrlAuth, id = " << keyboard_button.id;
+      string_builder << "UrlAuth, ID = " << keyboard_button.id;
       break;
     case InlineKeyboardButton::Type::CallbackWithPassword:
       string_builder << "CallbackWithPassword";
+      break;
+    case InlineKeyboardButton::Type::User:
+      string_builder << "User " << keyboard_button.user_id.get();
+      break;
+    case InlineKeyboardButton::Type::WebView:
+      string_builder << "WebView";
       break;
     default:
       UNREACHABLE();
@@ -104,11 +121,14 @@ bool operator==(const ReplyMarkup &lhs, const ReplyMarkup &rhs) {
   if (lhs.is_personal != rhs.is_personal) {
     return false;
   }
+  if (lhs.placeholder != rhs.placeholder) {
+    return false;
+  }
   if (lhs.type != ReplyMarkup::Type::ShowKeyboard) {
     return true;
   }
-  return lhs.need_resize_keyboard == rhs.need_resize_keyboard && lhs.is_one_time_keyboard == rhs.is_one_time_keyboard &&
-         lhs.keyboard == rhs.keyboard;
+  return lhs.is_persistent == rhs.is_persistent && lhs.need_resize_keyboard == rhs.need_resize_keyboard &&
+         lhs.is_one_time_keyboard == rhs.is_one_time_keyboard && lhs.keyboard == rhs.keyboard;
 }
 
 bool operator!=(const ReplyMarkup &lhs, const ReplyMarkup &rhs) {
@@ -136,8 +156,14 @@ StringBuilder &ReplyMarkup::print(StringBuilder &string_builder) const {
   if (is_personal) {
     string_builder << ", personal";
   }
+  if (!placeholder.empty()) {
+    string_builder << ", placeholder \"" << placeholder << '"';
+  }
 
   if (type == ReplyMarkup::Type::ShowKeyboard) {
+    if (is_persistent) {
+      string_builder << ", persistent";
+    }
     if (need_resize_keyboard) {
       string_builder << ", need resize";
     }
@@ -201,6 +227,27 @@ static KeyboardButton get_keyboard_button(tl_object_ptr<telegram_api::KeyboardBu
       button.text = std::move(keyboard_button->text_);
       break;
     }
+    case telegram_api::keyboardButtonSimpleWebView::ID: {
+      auto keyboard_button = move_tl_object_as<telegram_api::keyboardButtonSimpleWebView>(keyboard_button_ptr);
+      auto r_url = LinkManager::check_link(keyboard_button->url_);
+      if (r_url.is_error()) {
+        LOG(ERROR) << "Keyboard Web App " << r_url.error().message();
+        break;
+      }
+
+      button.type = KeyboardButton::Type::WebView;
+      button.text = std::move(keyboard_button->text_);
+      button.url = r_url.move_as_ok();
+      break;
+    }
+    case telegram_api::keyboardButtonRequestPeer::ID: {
+      auto keyboard_button = move_tl_object_as<telegram_api::keyboardButtonRequestPeer>(keyboard_button_ptr);
+      button.type = KeyboardButton::Type::RequestDialog;
+      button.text = std::move(keyboard_button->text_);
+      button.requested_dialog_type = td::make_unique<RequestedDialogType>(
+          std::move(keyboard_button->peer_type_), keyboard_button->button_id_, keyboard_button->max_quantity_);
+      break;
+    }
     default:
       LOG(ERROR) << "Unsupported keyboard button: " << to_string(keyboard_button_ptr);
   }
@@ -215,9 +262,14 @@ static InlineKeyboardButton get_inline_keyboard_button(
   switch (keyboard_button_ptr->get_id()) {
     case telegram_api::keyboardButtonUrl::ID: {
       auto keyboard_button = move_tl_object_as<telegram_api::keyboardButtonUrl>(keyboard_button_ptr);
+      auto r_url = LinkManager::check_link(keyboard_button->url_);
+      if (r_url.is_error()) {
+        LOG(ERROR) << "Inline keyboard " << r_url.error().message();
+        break;
+      }
       button.type = InlineKeyboardButton::Type::Url;
       button.text = std::move(keyboard_button->text_);
-      button.data = std::move(keyboard_button->url_);
+      button.data = r_url.move_as_ok();
       break;
     }
     case telegram_api::keyboardButtonCallback::ID: {
@@ -236,11 +288,34 @@ static InlineKeyboardButton get_inline_keyboard_button(
     }
     case telegram_api::keyboardButtonSwitchInline::ID: {
       auto keyboard_button = move_tl_object_as<telegram_api::keyboardButtonSwitchInline>(keyboard_button_ptr);
-      button.type = (keyboard_button->flags_ & telegram_api::keyboardButtonSwitchInline::SAME_PEER_MASK) != 0
-                        ? InlineKeyboardButton::Type::SwitchInlineCurrentDialog
-                        : InlineKeyboardButton::Type::SwitchInline;
+      button.type = keyboard_button->same_peer_ ? InlineKeyboardButton::Type::SwitchInlineCurrentDialog
+                                                : InlineKeyboardButton::Type::SwitchInline;
       button.text = std::move(keyboard_button->text_);
       button.data = std::move(keyboard_button->query_);
+      if (!keyboard_button->same_peer_) {
+        for (auto &peer_type : keyboard_button->peer_types_) {
+          switch (peer_type->get_id()) {
+            case telegram_api::inlineQueryPeerTypePM::ID:
+              button.id |= InlineKeyboardButton::USERS_MASK;
+              break;
+            case telegram_api::inlineQueryPeerTypeBotPM::ID:
+              button.id |= InlineKeyboardButton::BOTS_MASK;
+              break;
+            case telegram_api::inlineQueryPeerTypeChat::ID:
+            case telegram_api::inlineQueryPeerTypeMegagroup::ID:
+              button.id |= InlineKeyboardButton::CHATS_MASK;
+              break;
+            case telegram_api::inlineQueryPeerTypeBroadcast::ID:
+              button.id |= InlineKeyboardButton::BROADCASTS_MASK;
+              break;
+            default:
+              LOG(ERROR) << "Receive " << to_string(peer_type);
+          }
+        }
+      }
+      if (button.id == InlineKeyboardButton::FULL_MASK) {
+        button.id = 0;
+      }
       break;
     }
     case telegram_api::keyboardButtonBuy::ID: {
@@ -251,13 +326,40 @@ static InlineKeyboardButton get_inline_keyboard_button(
     }
     case telegram_api::keyboardButtonUrlAuth::ID: {
       auto keyboard_button = move_tl_object_as<telegram_api::keyboardButtonUrlAuth>(keyboard_button_ptr);
+      auto r_url = LinkManager::check_link(keyboard_button->url_);
+      if (r_url.is_error()) {
+        LOG(ERROR) << "Inline keyboard Login " << r_url.error().message();
+        break;
+      }
       button.type = InlineKeyboardButton::Type::UrlAuth;
       button.id = keyboard_button->button_id_;
       button.text = std::move(keyboard_button->text_);
-      button.data = std::move(keyboard_button->url_);
-      if ((keyboard_button->flags_ & telegram_api::keyboardButtonUrlAuth::FWD_TEXT_MASK) != 0) {
-        button.forward_text = std::move(keyboard_button->fwd_text_);
+      button.forward_text = std::move(keyboard_button->fwd_text_);
+      button.data = r_url.move_as_ok();
+      break;
+    }
+    case telegram_api::keyboardButtonUserProfile::ID: {
+      auto keyboard_button = move_tl_object_as<telegram_api::keyboardButtonUserProfile>(keyboard_button_ptr);
+      auto user_id = UserId(keyboard_button->user_id_);
+      if (!user_id.is_valid()) {
+        LOG(ERROR) << "Receive " << user_id << " in inline keyboard";
+        break;
       }
+      button.type = InlineKeyboardButton::Type::User;
+      button.text = std::move(keyboard_button->text_);
+      button.user_id = user_id;
+      break;
+    }
+    case telegram_api::keyboardButtonWebView::ID: {
+      auto keyboard_button = move_tl_object_as<telegram_api::keyboardButtonWebView>(keyboard_button_ptr);
+      auto r_url = LinkManager::check_link(keyboard_button->url_);
+      if (r_url.is_error()) {
+        LOG(ERROR) << "Inline keyboard Web App " << r_url.error().message();
+        break;
+      }
+      button.type = InlineKeyboardButton::Type::WebView;
+      button.text = std::move(keyboard_button->text_);
+      button.data = r_url.move_as_ok();
       break;
     }
     default:
@@ -304,9 +406,11 @@ unique_ptr<ReplyMarkup> get_reply_markup(tl_object_ptr<telegram_api::ReplyMarkup
     case telegram_api::replyKeyboardMarkup::ID: {
       auto keyboard_markup = move_tl_object_as<telegram_api::replyKeyboardMarkup>(reply_markup_ptr);
       reply_markup->type = ReplyMarkup::Type::ShowKeyboard;
+      reply_markup->is_persistent = (keyboard_markup->flags_ & REPLY_MARKUP_FLAG_IS_PERSISTENT) != 0;
       reply_markup->need_resize_keyboard = (keyboard_markup->flags_ & REPLY_MARKUP_FLAG_NEED_RESIZE_KEYBOARD) != 0;
       reply_markup->is_one_time_keyboard = (keyboard_markup->flags_ & REPLY_MARKUP_FLAG_IS_ONE_TIME_KEYBOARD) != 0;
       reply_markup->is_personal = (keyboard_markup->flags_ & REPLY_MARKUP_FLAG_IS_PERSONAL) != 0;
+      reply_markup->placeholder = std::move(keyboard_markup->placeholder_);
       reply_markup->keyboard.reserve(keyboard_markup->rows_.size());
       for (auto &row : keyboard_markup->rows_) {
         vector<KeyboardButton> buttons;
@@ -336,6 +440,7 @@ unique_ptr<ReplyMarkup> get_reply_markup(tl_object_ptr<telegram_api::ReplyMarkup
       auto force_reply_markup = move_tl_object_as<telegram_api::replyKeyboardForceReply>(reply_markup_ptr);
       reply_markup->type = ReplyMarkup::Type::ForceReply;
       reply_markup->is_personal = (force_reply_markup->flags_ & REPLY_MARKUP_FLAG_IS_PERSONAL) != 0;
+      reply_markup->placeholder = std::move(force_reply_markup->placeholder_);
       break;
     }
     default:
@@ -362,12 +467,14 @@ static Result<KeyboardButton> get_keyboard_button(tl_object_ptr<td_api::keyboard
   if (!clean_input_string(button->text_)) {
     return Status::Error(400, "Keyboard button text must be encoded in UTF-8");
   }
+  if (button->text_.empty()) {
+    return Status::Error(400, "Keyboard button text must be non-empty");
+  }
 
   KeyboardButton current_button;
   current_button.text = std::move(button->text_);
 
-  int32 button_type_id = button->type_ == nullptr ? td_api::keyboardButtonTypeText::ID : button->type_->get_id();
-  switch (button_type_id) {
+  switch (button->type_ == nullptr ? td_api::keyboardButtonTypeText::ID : button->type_->get_id()) {
     case td_api::keyboardButtonTypeText::ID:
       current_button.type = KeyboardButton::Type::Text;
       break;
@@ -400,61 +507,142 @@ static Result<KeyboardButton> get_keyboard_button(tl_object_ptr<td_api::keyboard
       }
       break;
     }
+    case td_api::keyboardButtonTypeWebApp::ID: {
+      if (!request_buttons_allowed) {
+        return Status::Error(400, "Web App buttons can be used in private chats only");
+      }
+
+      auto button_type = move_tl_object_as<td_api::keyboardButtonTypeWebApp>(button->type_);
+      auto user_id = LinkManager::get_link_user_id(button_type->url_);
+      if (user_id.is_valid()) {
+        return Status::Error(400, "Link to a user can't be used in Web App URL buttons");
+      }
+      auto r_url = LinkManager::check_link(button_type->url_, true, !G()->is_test_dc());
+      if (r_url.is_error()) {
+        return Status::Error(400, PSLICE() << "Keyboard button Web App " << r_url.error().message());
+      }
+      current_button.type = KeyboardButton::Type::WebView;
+      current_button.url = std::move(button_type->url_);
+      break;
+    }
+    case td_api::keyboardButtonTypeRequestUsers::ID: {
+      if (!request_buttons_allowed) {
+        return Status::Error(400, "Users can be requested in private chats only");
+      }
+      auto button_type = move_tl_object_as<td_api::keyboardButtonTypeRequestUsers>(button->type_);
+      current_button.type = KeyboardButton::Type::RequestDialog;
+      current_button.requested_dialog_type = td::make_unique<RequestedDialogType>(std::move(button_type));
+      break;
+    }
+    case td_api::keyboardButtonTypeRequestChat::ID: {
+      if (!request_buttons_allowed) {
+        return Status::Error(400, "Chats can be requested in private chats only");
+      }
+      auto button_type = move_tl_object_as<td_api::keyboardButtonTypeRequestChat>(button->type_);
+      current_button.type = KeyboardButton::Type::RequestDialog;
+      current_button.requested_dialog_type = td::make_unique<RequestedDialogType>(std::move(button_type));
+      break;
+    }
     default:
       UNREACHABLE();
   }
-  return current_button;
+  return std::move(current_button);
 }
 
 static Result<InlineKeyboardButton> get_inline_keyboard_button(tl_object_ptr<td_api::inlineKeyboardButton> &&button,
                                                                bool switch_inline_buttons_allowed) {
   CHECK(button != nullptr);
   if (!clean_input_string(button->text_)) {
-    return Status::Error(400, "Keyboard button text must be encoded in UTF-8");
+    return Status::Error(400, "Inline keyboard button text must be encoded in UTF-8");
+  }
+  if (button->text_.empty()) {
+    return Status::Error(400, "Inline keyboard button text must be non-empty");
+  }
+  if (button->type_ == nullptr) {
+    return Status::Error(400, "Inline keyboard button type must be non-empty");
   }
 
   InlineKeyboardButton current_button;
   current_button.text = std::move(button->text_);
 
-  if (button->type_ == nullptr) {
-    return Status::Error(400, "Inline keyboard button type can't be empty");
-  }
-
-  int32 button_type_id = button->type_->get_id();
-  switch (button_type_id) {
+  switch (button->type_->get_id()) {
     case td_api::inlineKeyboardButtonTypeUrl::ID: {
+      auto button_type = move_tl_object_as<td_api::inlineKeyboardButtonTypeUrl>(button->type_);
+      auto user_id = LinkManager::get_link_user_id(button_type->url_);
+      if (user_id.is_valid()) {
+        current_button.type = InlineKeyboardButton::Type::User;
+        current_button.user_id = user_id;
+        break;
+      }
+      auto r_url = LinkManager::check_link(button_type->url_);
+      if (r_url.is_error()) {
+        return Status::Error(400, PSLICE() << "Inline keyboard button " << r_url.error().message());
+      }
       current_button.type = InlineKeyboardButton::Type::Url;
-      TRY_RESULT_ASSIGN(current_button.data,
-                        check_url(static_cast<const td_api::inlineKeyboardButtonTypeUrl *>(button->type_.get())->url_));
+      current_button.data = r_url.move_as_ok();
       if (!clean_input_string(current_button.data)) {
-        return Status::Error(400, "Inline keyboard button url must be encoded in UTF-8");
+        return Status::Error(400, "Inline keyboard button URL must be encoded in UTF-8");
       }
       break;
     }
-    case td_api::inlineKeyboardButtonTypeCallback::ID:
+    case td_api::inlineKeyboardButtonTypeCallback::ID: {
+      auto button_type = move_tl_object_as<td_api::inlineKeyboardButtonTypeCallback>(button->type_);
       current_button.type = InlineKeyboardButton::Type::Callback;
-      current_button.data =
-          std::move(static_cast<td_api::inlineKeyboardButtonTypeCallback *>(button->type_.get())->data_);
+      current_button.data = std::move(button_type->data_);
       break;
+    }
     case td_api::inlineKeyboardButtonTypeCallbackGame::ID:
       current_button.type = InlineKeyboardButton::Type::CallbackGame;
       break;
     case td_api::inlineKeyboardButtonTypeCallbackWithPassword::ID:
       return Status::Error(400, "Can't use CallbackWithPassword inline button");
     case td_api::inlineKeyboardButtonTypeSwitchInline::ID: {
-      auto switch_inline_button = move_tl_object_as<td_api::inlineKeyboardButtonTypeSwitchInline>(button->type_);
+      auto button_type = move_tl_object_as<td_api::inlineKeyboardButtonTypeSwitchInline>(button->type_);
+      if (button_type->target_chat_ == nullptr) {
+        return Status::Error(400, "Target chat must be non-empty");
+      }
+      switch (button_type->target_chat_->get_id()) {
+        case td_api::targetChatChosen::ID: {
+          auto target = static_cast<const td_api::targetChatChosen *>(button_type->target_chat_.get());
+          if (target->allow_user_chats_) {
+            current_button.id |= InlineKeyboardButton::USERS_MASK;
+          }
+          if (target->allow_bot_chats_) {
+            current_button.id |= InlineKeyboardButton::BOTS_MASK;
+          }
+          if (target->allow_group_chats_) {
+            current_button.id |= InlineKeyboardButton::CHATS_MASK;
+          }
+          if (target->allow_channel_chats_) {
+            current_button.id |= InlineKeyboardButton::BROADCASTS_MASK;
+          }
+          if (current_button.id == 0) {
+            return Status::Error(400, "At least one chat type must be allowed");
+          }
+          if (current_button.id == InlineKeyboardButton::FULL_MASK) {
+            current_button.id = 0;
+          }
+          current_button.type = InlineKeyboardButton::Type::SwitchInline;
+          break;
+        }
+        case td_api::targetChatCurrent::ID:
+          current_button.type = InlineKeyboardButton::Type::SwitchInlineCurrentDialog;
+          break;
+        case td_api::targetChatInternalLink::ID:
+          return Status::Error(400, "Unsupported target chat specified");
+        default:
+          UNREACHABLE();
+      }
       if (!switch_inline_buttons_allowed) {
-        const char *button_name =
-            switch_inline_button->in_current_chat_ ? "switch_inline_query_current_chat" : "switch_inline_query";
+        const char *button_name = current_button.type == InlineKeyboardButton::Type::SwitchInline
+                                      ? "switch_inline_query"
+                                      : "switch_inline_query_current_chat";
         return Status::Error(400, PSLICE() << "Can't use " << button_name
-                                           << " in a channel chat, because a user will not be able to use the button "
-                                              "without knowing bot's username");
+                                           << " button in a channel chat, because users will not be able to use the "
+                                              "button without knowing bot's username");
       }
 
-      current_button.type = switch_inline_button->in_current_chat_
-                                ? InlineKeyboardButton::Type::SwitchInlineCurrentDialog
-                                : InlineKeyboardButton::Type::SwitchInline;
-      current_button.data = std::move(switch_inline_button->query_);
+      current_button.data = std::move(button_type->query_);
       if (!clean_input_string(current_button.data)) {
         return Status::Error(400, "Inline keyboard button switch inline query must be encoded in UTF-8");
       }
@@ -464,19 +652,54 @@ static Result<InlineKeyboardButton> get_inline_keyboard_button(tl_object_ptr<td_
       current_button.type = InlineKeyboardButton::Type::Buy;
       break;
     case td_api::inlineKeyboardButtonTypeLoginUrl::ID: {
+      auto button_type = td_api::move_object_as<td_api::inlineKeyboardButtonTypeLoginUrl>(button->type_);
+      auto user_id = LinkManager::get_link_user_id(button_type->url_);
+      if (user_id.is_valid()) {
+        return Status::Error(400, "Link to a user can't be used in login URL buttons");
+      }
+      auto r_url = LinkManager::check_link(button_type->url_, true, !G()->is_test_dc());
+      if (r_url.is_error()) {
+        return Status::Error(400, PSLICE() << "Inline keyboard button login " << r_url.error().message());
+      }
       current_button.type = InlineKeyboardButton::Type::UrlAuth;
-      auto login_url = td_api::move_object_as<td_api::inlineKeyboardButtonTypeLoginUrl>(button->type_);
-      TRY_RESULT_ASSIGN(current_button.data, check_url(login_url->url_));
-      current_button.forward_text = std::move(login_url->forward_text_);
+      current_button.data = r_url.move_as_ok();
+      current_button.forward_text = std::move(button_type->forward_text_);
       if (!clean_input_string(current_button.data)) {
-        return Status::Error(400, "Inline keyboard button login url must be encoded in UTF-8");
+        return Status::Error(400, "Inline keyboard button login URL must be encoded in UTF-8");
       }
       if (!clean_input_string(current_button.forward_text)) {
         return Status::Error(400, "Inline keyboard button forward text must be encoded in UTF-8");
       }
-      current_button.id = login_url->id_;
-      if (current_button.id == 0 || current_button.id == std::numeric_limits<int32>::min()) {
+      current_button.id = button_type->id_;
+      if (current_button.id == std::numeric_limits<int64>::min() ||
+          !UserId(current_button.id >= 0 ? current_button.id : -current_button.id).is_valid()) {
         return Status::Error(400, "Invalid bot_user_id specified");
+      }
+      break;
+    }
+    case td_api::inlineKeyboardButtonTypeUser::ID: {
+      auto button_type = td_api::move_object_as<td_api::inlineKeyboardButtonTypeUser>(button->type_);
+      current_button.type = InlineKeyboardButton::Type::User;
+      current_button.user_id = UserId(button_type->user_id_);
+      if (!current_button.user_id.is_valid()) {
+        return Status::Error(400, "Invalid user_id specified");
+      }
+      break;
+    }
+    case td_api::inlineKeyboardButtonTypeWebApp::ID: {
+      auto button_type = move_tl_object_as<td_api::inlineKeyboardButtonTypeWebApp>(button->type_);
+      auto user_id = LinkManager::get_link_user_id(button_type->url_);
+      if (user_id.is_valid()) {
+        return Status::Error(400, "Link to a user can't be used in Web App URL buttons");
+      }
+      auto r_url = LinkManager::check_link(button_type->url_, true, !G()->is_test_dc());
+      if (r_url.is_error()) {
+        return Status::Error(400, PSLICE() << "Inline keyboard button Web App " << r_url.error().message());
+      }
+      current_button.type = InlineKeyboardButton::Type::WebView;
+      current_button.data = r_url.move_as_ok();
+      if (!clean_input_string(current_button.data)) {
+        return Status::Error(400, "Inline keyboard button Web App URL must be encoded in UTF-8");
       }
       break;
     }
@@ -484,11 +707,11 @@ static Result<InlineKeyboardButton> get_inline_keyboard_button(tl_object_ptr<td_
       UNREACHABLE();
   }
 
-  return current_button;
+  return std::move(current_button);
 }
 
-Result<unique_ptr<ReplyMarkup>> get_reply_markup(tl_object_ptr<td_api::ReplyMarkup> &&reply_markup_ptr, bool is_bot,
-                                                 bool only_inline_keyboard, bool request_buttons_allowed,
+Result<unique_ptr<ReplyMarkup>> get_reply_markup(td_api::object_ptr<td_api::ReplyMarkup> &&reply_markup_ptr,
+                                                 bool is_bot, bool only_inline_keyboard, bool request_buttons_allowed,
                                                  bool switch_inline_buttons_allowed) {
   CHECK(!only_inline_keyboard || !request_buttons_allowed);
   if (reply_markup_ptr == nullptr || !is_bot) {
@@ -505,9 +728,11 @@ Result<unique_ptr<ReplyMarkup>> get_reply_markup(tl_object_ptr<td_api::ReplyMark
     case td_api::replyMarkupShowKeyboard::ID: {
       auto show_keyboard_markup = move_tl_object_as<td_api::replyMarkupShowKeyboard>(reply_markup_ptr);
       reply_markup->type = ReplyMarkup::Type::ShowKeyboard;
+      reply_markup->is_persistent = show_keyboard_markup->is_persistent_;
       reply_markup->need_resize_keyboard = show_keyboard_markup->resize_keyboard_;
       reply_markup->is_one_time_keyboard = show_keyboard_markup->one_time_;
       reply_markup->is_personal = show_keyboard_markup->is_personal_;
+      reply_markup->placeholder = std::move(show_keyboard_markup->input_field_placeholder_);
 
       reply_markup->keyboard.reserve(show_keyboard_markup->rows_.size());
       int32 total_button_count = 0;
@@ -531,7 +756,7 @@ Result<unique_ptr<ReplyMarkup>> get_reply_markup(tl_object_ptr<td_api::ReplyMark
           }
         }
         if (!row_buttons.empty()) {
-          reply_markup->keyboard.push_back(row_buttons);
+          reply_markup->keyboard.push_back(std::move(row_buttons));
         }
         if (total_button_count >= 300) {
           break;
@@ -568,7 +793,7 @@ Result<unique_ptr<ReplyMarkup>> get_reply_markup(tl_object_ptr<td_api::ReplyMark
           }
         }
         if (!row_buttons.empty()) {
-          reply_markup->inline_keyboard.push_back(row_buttons);
+          reply_markup->inline_keyboard.push_back(std::move(row_buttons));
         }
         if (total_button_count >= 300) {
           break;
@@ -589,6 +814,7 @@ Result<unique_ptr<ReplyMarkup>> get_reply_markup(tl_object_ptr<td_api::ReplyMark
       auto force_reply_markup = move_tl_object_as<td_api::replyMarkupForceReply>(reply_markup_ptr);
       reply_markup->type = ReplyMarkup::Type::ForceReply;
       reply_markup->is_personal = force_reply_markup->is_personal_;
+      reply_markup->placeholder = std::move(force_reply_markup->input_field_placeholder_);
       break;
     }
     default:
@@ -598,7 +824,61 @@ Result<unique_ptr<ReplyMarkup>> get_reply_markup(tl_object_ptr<td_api::ReplyMark
   return std::move(reply_markup);
 }
 
-static tl_object_ptr<telegram_api::KeyboardButton> get_keyboard_button(const KeyboardButton &keyboard_button) {
+Result<unique_ptr<ReplyMarkup>> get_reply_markup(td_api::object_ptr<td_api::ReplyMarkup> &&reply_markup_ptr,
+                                                 DialogId dialog_id, bool is_bot, bool is_anonymous) {
+  auto dialog_type = dialog_id.get_type();
+  bool only_inline_keyboard = is_anonymous;
+  bool request_buttons_allowed = dialog_type == DialogType::User;
+  bool switch_inline_buttons_allowed = !is_anonymous;
+
+  TRY_RESULT(reply_markup, get_reply_markup(std::move(reply_markup_ptr), is_bot, only_inline_keyboard,
+                                            request_buttons_allowed, switch_inline_buttons_allowed));
+  if (reply_markup == nullptr) {
+    return nullptr;
+  }
+  switch (dialog_type) {
+    case DialogType::User:
+      if (reply_markup->type != ReplyMarkup::Type::InlineKeyboard) {
+        reply_markup->is_personal = false;
+      }
+      break;
+    case DialogType::Channel:
+    case DialogType::Chat:
+    case DialogType::SecretChat:
+    case DialogType::None:
+      // nothing special
+      break;
+    default:
+      UNREACHABLE();
+  }
+  return std::move(reply_markup);
+}
+
+unique_ptr<ReplyMarkup> dup_reply_markup(const unique_ptr<ReplyMarkup> &reply_markup) {
+  if (reply_markup == nullptr) {
+    return nullptr;
+  }
+  auto result = make_unique<ReplyMarkup>();
+  result->type = reply_markup->type;
+  result->is_personal = reply_markup->is_personal;
+  result->is_persistent = reply_markup->is_persistent;
+  result->need_resize_keyboard = reply_markup->need_resize_keyboard;
+  result->keyboard = transform(reply_markup->keyboard, [](const vector<KeyboardButton> &row) {
+    return transform(row, [](const KeyboardButton &button) {
+      KeyboardButton result;
+      result.type = button.type;
+      result.text = button.text;
+      result.url = button.url;
+      result.requested_dialog_type = td::make_unique<RequestedDialogType>(*button.requested_dialog_type);
+      return result;
+    });
+  });
+  result->placeholder = reply_markup->placeholder;
+  result->inline_keyboard = reply_markup->inline_keyboard;
+  return result;
+}
+
+static tl_object_ptr<telegram_api::KeyboardButton> get_input_keyboard_button(const KeyboardButton &keyboard_button) {
   switch (keyboard_button.type) {
     case KeyboardButton::Type::Text:
       return make_tl_object<telegram_api::keyboardButton>(keyboard_button.text);
@@ -612,36 +892,62 @@ static tl_object_ptr<telegram_api::KeyboardButton> get_keyboard_button(const Key
       return make_tl_object<telegram_api::keyboardButtonRequestPoll>(1, true, keyboard_button.text);
     case KeyboardButton::Type::RequestPollRegular:
       return make_tl_object<telegram_api::keyboardButtonRequestPoll>(1, false, keyboard_button.text);
+    case KeyboardButton::Type::WebView:
+      return make_tl_object<telegram_api::keyboardButtonSimpleWebView>(keyboard_button.text, keyboard_button.url);
+    case KeyboardButton::Type::RequestDialog:
+      CHECK(keyboard_button.requested_dialog_type != nullptr);
+      return make_tl_object<telegram_api::keyboardButtonRequestPeer>(
+          keyboard_button.text, keyboard_button.requested_dialog_type->get_button_id(),
+          keyboard_button.requested_dialog_type->get_input_request_peer_type_object(),
+          keyboard_button.requested_dialog_type->get_max_quantity());
     default:
       UNREACHABLE();
       return nullptr;
   }
 }
 
-static tl_object_ptr<telegram_api::KeyboardButton> get_inline_keyboard_button(
-    const InlineKeyboardButton &keyboard_button) {
+static tl_object_ptr<telegram_api::KeyboardButton> get_input_keyboard_button(
+    ContactsManager *contacts_manager, const InlineKeyboardButton &keyboard_button) {
   switch (keyboard_button.type) {
     case InlineKeyboardButton::Type::Url:
       return make_tl_object<telegram_api::keyboardButtonUrl>(keyboard_button.text, keyboard_button.data);
     case InlineKeyboardButton::Type::Callback:
-      return make_tl_object<telegram_api::keyboardButtonCallback>(0, false /*ignored*/, keyboard_button.text,
+      return make_tl_object<telegram_api::keyboardButtonCallback>(0, false, keyboard_button.text,
                                                                   BufferSlice(keyboard_button.data));
     case InlineKeyboardButton::Type::CallbackGame:
       return make_tl_object<telegram_api::keyboardButtonGame>(keyboard_button.text);
-    case InlineKeyboardButton::Type::SwitchInline:
-    case InlineKeyboardButton::Type::SwitchInlineCurrentDialog: {
+    case InlineKeyboardButton::Type::SwitchInline: {
       int32 flags = 0;
-      if (keyboard_button.type == InlineKeyboardButton::Type::SwitchInlineCurrentDialog) {
-        flags |= telegram_api::keyboardButtonSwitchInline::SAME_PEER_MASK;
+      vector<telegram_api::object_ptr<telegram_api::InlineQueryPeerType>> peer_types;
+      if (keyboard_button.id != 0) {
+        CHECK(keyboard_button.type == InlineKeyboardButton::Type::SwitchInline);
+        flags |= telegram_api::keyboardButtonSwitchInline::PEER_TYPES_MASK;
+        if ((keyboard_button.id & InlineKeyboardButton::USERS_MASK) != 0) {
+          peer_types.push_back(telegram_api::make_object<telegram_api::inlineQueryPeerTypePM>());
+        }
+        if ((keyboard_button.id & InlineKeyboardButton::BOTS_MASK) != 0) {
+          peer_types.push_back(telegram_api::make_object<telegram_api::inlineQueryPeerTypeBotPM>());
+        }
+        if ((keyboard_button.id & InlineKeyboardButton::CHATS_MASK) != 0) {
+          peer_types.push_back(telegram_api::make_object<telegram_api::inlineQueryPeerTypeChat>());
+          peer_types.push_back(telegram_api::make_object<telegram_api::inlineQueryPeerTypeMegagroup>());
+        }
+        if ((keyboard_button.id & InlineKeyboardButton::BROADCASTS_MASK) != 0) {
+          peer_types.push_back(telegram_api::make_object<telegram_api::inlineQueryPeerTypeBroadcast>());
+        }
       }
-      return make_tl_object<telegram_api::keyboardButtonSwitchInline>(flags, false /*ignored*/, keyboard_button.text,
-                                                                      keyboard_button.data);
+      return make_tl_object<telegram_api::keyboardButtonSwitchInline>(flags, false, keyboard_button.text,
+                                                                      keyboard_button.data, std::move(peer_types));
     }
+    case InlineKeyboardButton::Type::SwitchInlineCurrentDialog:
+      return make_tl_object<telegram_api::keyboardButtonSwitchInline>(
+          telegram_api::keyboardButtonSwitchInline::SAME_PEER_MASK, true, keyboard_button.text, keyboard_button.data,
+          vector<telegram_api::object_ptr<telegram_api::InlineQueryPeerType>>());
     case InlineKeyboardButton::Type::Buy:
       return make_tl_object<telegram_api::keyboardButtonBuy>(keyboard_button.text);
     case InlineKeyboardButton::Type::UrlAuth: {
       int32 flags = 0;
-      int32 bot_user_id = keyboard_button.id;
+      int64 bot_user_id = keyboard_button.id;
       if (bot_user_id > 0) {
         flags |= telegram_api::inputKeyboardButtonUrlAuth::REQUEST_WRITE_ACCESS_MASK;
       } else {
@@ -650,25 +956,36 @@ static tl_object_ptr<telegram_api::KeyboardButton> get_inline_keyboard_button(
       if (!keyboard_button.forward_text.empty()) {
         flags |= telegram_api::inputKeyboardButtonUrlAuth::FWD_TEXT_MASK;
       }
-      auto input_user = G()->td().get_actor_unsafe()->contacts_manager_->get_input_user(UserId(bot_user_id));
-      if (input_user == nullptr) {
-        LOG(ERROR) << "Failed to get InputUser for " << bot_user_id;
+      auto r_input_user = contacts_manager->get_input_user(UserId(bot_user_id));
+      if (r_input_user.is_error()) {
+        LOG(ERROR) << "Failed to get InputUser for " << bot_user_id << ": " << r_input_user.error();
         return make_tl_object<telegram_api::keyboardButtonUrl>(keyboard_button.text, keyboard_button.data);
       }
       return make_tl_object<telegram_api::inputKeyboardButtonUrlAuth>(flags, false /*ignored*/, keyboard_button.text,
                                                                       keyboard_button.forward_text,
-                                                                      keyboard_button.data, std::move(input_user));
+                                                                      keyboard_button.data, r_input_user.move_as_ok());
     }
     case InlineKeyboardButton::Type::CallbackWithPassword:
       UNREACHABLE();
       break;
+    case InlineKeyboardButton::Type::User: {
+      auto r_input_user = contacts_manager->get_input_user(keyboard_button.user_id);
+      if (r_input_user.is_error()) {
+        LOG(ERROR) << "Failed to get InputUser for " << keyboard_button.user_id << ": " << r_input_user.error();
+        r_input_user = make_tl_object<telegram_api::inputUserEmpty>();
+      }
+      return make_tl_object<telegram_api::inputKeyboardButtonUserProfile>(keyboard_button.text,
+                                                                          r_input_user.move_as_ok());
+    }
+    case InlineKeyboardButton::Type::WebView:
+      return make_tl_object<telegram_api::keyboardButtonWebView>(keyboard_button.text, keyboard_button.data);
     default:
       UNREACHABLE();
       return nullptr;
   }
 }
 
-tl_object_ptr<telegram_api::ReplyMarkup> ReplyMarkup::get_input_reply_markup() const {
+tl_object_ptr<telegram_api::ReplyMarkup> ReplyMarkup::get_input_reply_markup(ContactsManager *contacts_manager) const {
   LOG(DEBUG) << "Send " << *this;
   switch (type) {
     case ReplyMarkup::Type::InlineKeyboard: {
@@ -678,7 +995,7 @@ tl_object_ptr<telegram_api::ReplyMarkup> ReplyMarkup::get_input_reply_markup() c
         vector<tl_object_ptr<telegram_api::KeyboardButton>> buttons;
         buttons.reserve(row.size());
         for (auto &button : row) {
-          buttons.push_back(get_inline_keyboard_button(button));
+          buttons.push_back(get_input_keyboard_button(contacts_manager, button));
         }
         rows.push_back(make_tl_object<telegram_api::keyboardButtonRow>(std::move(buttons)));
       }
@@ -692,21 +1009,23 @@ tl_object_ptr<telegram_api::ReplyMarkup> ReplyMarkup::get_input_reply_markup() c
         vector<tl_object_ptr<telegram_api::KeyboardButton>> buttons;
         buttons.reserve(row.size());
         for (auto &button : row) {
-          buttons.push_back(get_keyboard_button(button));
+          buttons.push_back(get_input_keyboard_button(button));
         }
         rows.push_back(make_tl_object<telegram_api::keyboardButtonRow>(std::move(buttons)));
       }
       LOG(DEBUG) << "Return replyKeyboardMarkup to send it";
       return make_tl_object<telegram_api::replyKeyboardMarkup>(
-          need_resize_keyboard * REPLY_MARKUP_FLAG_NEED_RESIZE_KEYBOARD +
+          is_persistent * REPLY_MARKUP_FLAG_IS_PERSISTENT +
+              need_resize_keyboard * REPLY_MARKUP_FLAG_NEED_RESIZE_KEYBOARD +
               is_one_time_keyboard * REPLY_MARKUP_FLAG_IS_ONE_TIME_KEYBOARD +
-              is_personal * REPLY_MARKUP_FLAG_IS_PERSONAL,
-          false /*ignored*/, false /*ignored*/, false /*ignored*/, std::move(rows));
+              is_personal * REPLY_MARKUP_FLAG_IS_PERSONAL + (!placeholder.empty()) * REPLY_MARKUP_FLAG_HAS_PLACEHOLDER,
+          false /*ignored*/, false /*ignored*/, false /*ignored*/, false /*ignored*/, std::move(rows), placeholder);
     }
     case ReplyMarkup::Type::ForceReply:
       LOG(DEBUG) << "Return replyKeyboardForceReply to send it";
-      return make_tl_object<telegram_api::replyKeyboardForceReply>(is_personal * REPLY_MARKUP_FLAG_IS_PERSONAL,
-                                                                   false /*ignored*/, false /*ignored*/);
+      return make_tl_object<telegram_api::replyKeyboardForceReply>(
+          is_personal * REPLY_MARKUP_FLAG_IS_PERSONAL + (!placeholder.empty()) * REPLY_MARKUP_FLAG_HAS_PLACEHOLDER,
+          false /*ignored*/, false /*ignored*/, placeholder);
     case ReplyMarkup::Type::RemoveKeyboard:
       LOG(DEBUG) << "Return replyKeyboardHide to send it";
       return make_tl_object<telegram_api::replyKeyboardHide>(is_personal * REPLY_MARKUP_FLAG_IS_PERSONAL,
@@ -738,6 +1057,12 @@ static tl_object_ptr<td_api::keyboardButton> get_keyboard_button_object(const Ke
     case KeyboardButton::Type::RequestPollRegular:
       type = make_tl_object<td_api::keyboardButtonTypeRequestPoll>(true, false);
       break;
+    case KeyboardButton::Type::WebView:
+      type = make_tl_object<td_api::keyboardButtonTypeWebApp>(keyboard_button.url + "#kb");
+      break;
+    case KeyboardButton::Type::RequestDialog:
+      type = keyboard_button.requested_dialog_type->get_keyboard_button_type_object();
+      break;
     default:
       UNREACHABLE();
       return nullptr;
@@ -746,7 +1071,7 @@ static tl_object_ptr<td_api::keyboardButton> get_keyboard_button_object(const Ke
 }
 
 static tl_object_ptr<td_api::inlineKeyboardButton> get_inline_keyboard_button_object(
-    const InlineKeyboardButton &keyboard_button) {
+    ContactsManager *contacts_manager, const InlineKeyboardButton &keyboard_button) {
   tl_object_ptr<td_api::InlineKeyboardButtonType> type;
   switch (keyboard_button.type) {
     case InlineKeyboardButton::Type::Url:
@@ -758,11 +1083,21 @@ static tl_object_ptr<td_api::inlineKeyboardButton> get_inline_keyboard_button_ob
     case InlineKeyboardButton::Type::CallbackGame:
       type = make_tl_object<td_api::inlineKeyboardButtonTypeCallbackGame>();
       break;
-    case InlineKeyboardButton::Type::SwitchInline:
-      type = make_tl_object<td_api::inlineKeyboardButtonTypeSwitchInline>(keyboard_button.data, false);
+    case InlineKeyboardButton::Type::SwitchInline: {
+      auto mask = keyboard_button.id;
+      if (mask == 0) {
+        mask = InlineKeyboardButton::FULL_MASK;
+      }
+      type = make_tl_object<td_api::inlineKeyboardButtonTypeSwitchInline>(
+          keyboard_button.data,
+          td_api::make_object<td_api::targetChatChosen>(
+              (mask & InlineKeyboardButton::USERS_MASK) != 0, (mask & InlineKeyboardButton::BOTS_MASK) != 0,
+              (mask & InlineKeyboardButton::CHATS_MASK) != 0, (mask & InlineKeyboardButton::BROADCASTS_MASK) != 0));
       break;
+    }
     case InlineKeyboardButton::Type::SwitchInlineCurrentDialog:
-      type = make_tl_object<td_api::inlineKeyboardButtonTypeSwitchInline>(keyboard_button.data, true);
+      type = make_tl_object<td_api::inlineKeyboardButtonTypeSwitchInline>(
+          keyboard_button.data, td_api::make_object<td_api::targetChatCurrent>());
       break;
     case InlineKeyboardButton::Type::Buy:
       type = make_tl_object<td_api::inlineKeyboardButtonTypeBuy>();
@@ -774,6 +1109,17 @@ static tl_object_ptr<td_api::inlineKeyboardButton> get_inline_keyboard_button_ob
     case InlineKeyboardButton::Type::CallbackWithPassword:
       type = make_tl_object<td_api::inlineKeyboardButtonTypeCallbackWithPassword>(keyboard_button.data);
       break;
+    case InlineKeyboardButton::Type::User: {
+      bool need_user = contacts_manager != nullptr && !contacts_manager->is_user_bot(contacts_manager->get_my_id());
+      auto user_id =
+          need_user ? contacts_manager->get_user_id_object(keyboard_button.user_id, "get_inline_keyboard_button_object")
+                    : keyboard_button.user_id.get();
+      type = make_tl_object<td_api::inlineKeyboardButtonTypeUser>(user_id);
+      break;
+    }
+    case InlineKeyboardButton::Type::WebView:
+      type = make_tl_object<td_api::inlineKeyboardButtonTypeWebApp>(keyboard_button.data);
+      break;
     default:
       UNREACHABLE();
       return nullptr;
@@ -781,7 +1127,7 @@ static tl_object_ptr<td_api::inlineKeyboardButton> get_inline_keyboard_button_ob
   return make_tl_object<td_api::inlineKeyboardButton>(keyboard_button.text, std::move(type));
 }
 
-tl_object_ptr<td_api::ReplyMarkup> ReplyMarkup::get_reply_markup_object() const {
+tl_object_ptr<td_api::ReplyMarkup> ReplyMarkup::get_reply_markup_object(ContactsManager *contacts_manager) const {
   switch (type) {
     case ReplyMarkup::Type::InlineKeyboard: {
       vector<vector<tl_object_ptr<td_api::inlineKeyboardButton>>> rows;
@@ -790,7 +1136,7 @@ tl_object_ptr<td_api::ReplyMarkup> ReplyMarkup::get_reply_markup_object() const 
         vector<tl_object_ptr<td_api::inlineKeyboardButton>> buttons;
         buttons.reserve(row.size());
         for (auto &button : row) {
-          buttons.push_back(get_inline_keyboard_button_object(button));
+          buttons.push_back(get_inline_keyboard_button_object(contacts_manager, button));
         }
         rows.push_back(std::move(buttons));
       }
@@ -809,33 +1155,68 @@ tl_object_ptr<td_api::ReplyMarkup> ReplyMarkup::get_reply_markup_object() const 
         rows.push_back(std::move(buttons));
       }
 
-      return make_tl_object<td_api::replyMarkupShowKeyboard>(std::move(rows), need_resize_keyboard,
-                                                             is_one_time_keyboard, is_personal);
+      return make_tl_object<td_api::replyMarkupShowKeyboard>(std::move(rows), is_persistent, need_resize_keyboard,
+                                                             is_one_time_keyboard, is_personal, placeholder);
     }
     case ReplyMarkup::Type::RemoveKeyboard:
       return make_tl_object<td_api::replyMarkupRemoveKeyboard>(is_personal);
     case ReplyMarkup::Type::ForceReply:
-      return make_tl_object<td_api::replyMarkupForceReply>(is_personal);
+      return make_tl_object<td_api::replyMarkupForceReply>(is_personal, placeholder);
     default:
       UNREACHABLE();
       return nullptr;
   }
 }
 
-tl_object_ptr<telegram_api::ReplyMarkup> get_input_reply_markup(const unique_ptr<ReplyMarkup> &reply_markup) {
-  if (reply_markup == nullptr) {
-    return nullptr;
+Status ReplyMarkup::check_shared_dialog(Td *td, int32 button_id, DialogId dialog_id) const {
+  for (auto &row : keyboard) {
+    for (auto &button : row) {
+      if (button.requested_dialog_type != nullptr && button.requested_dialog_type->get_button_id() == button_id) {
+        return button.requested_dialog_type->check_shared_dialog(td, dialog_id);
+      }
+    }
   }
-
-  return reply_markup->get_input_reply_markup();
+  return Status::Error(400, "Button not found");
 }
 
-tl_object_ptr<td_api::ReplyMarkup> get_reply_markup_object(const unique_ptr<ReplyMarkup> &reply_markup) {
+Status ReplyMarkup::check_shared_dialog_count(int32 button_id, size_t count) const {
+  for (auto &row : keyboard) {
+    for (auto &button : row) {
+      if (button.requested_dialog_type != nullptr && button.requested_dialog_type->get_button_id() == button_id) {
+        return button.requested_dialog_type->check_shared_dialog_count(count);
+      }
+    }
+  }
+  return Status::Error(400, "Button not found");
+}
+
+tl_object_ptr<telegram_api::ReplyMarkup> get_input_reply_markup(ContactsManager *contacts_manager,
+                                                                const unique_ptr<ReplyMarkup> &reply_markup) {
   if (reply_markup == nullptr) {
     return nullptr;
   }
 
-  return reply_markup->get_reply_markup_object();
+  return reply_markup->get_input_reply_markup(contacts_manager);
+}
+
+tl_object_ptr<td_api::ReplyMarkup> get_reply_markup_object(ContactsManager *contacts_manager,
+                                                           const unique_ptr<ReplyMarkup> &reply_markup) {
+  if (reply_markup == nullptr) {
+    return nullptr;
+  }
+
+  return reply_markup->get_reply_markup_object(contacts_manager);
+}
+
+void add_reply_markup_dependencies(Dependencies &dependencies, const ReplyMarkup *reply_markup) {
+  if (reply_markup == nullptr) {
+    return;
+  }
+  for (auto &row : reply_markup->inline_keyboard) {
+    for (auto &button : row) {
+      dependencies.add(button.user_id);
+    }
+  }
 }
 
 }  // namespace td

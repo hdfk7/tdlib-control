@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -16,6 +16,7 @@
 #include "td/utils/port/Clocks.h"
 #include "td/utils/port/detail/skip_eintr.h"
 #include "td/utils/ScopeGuard.h"
+#include "td/utils/SliceBuilder.h"
 
 #include <utility>
 
@@ -125,6 +126,7 @@ Stat from_native_stat(const struct ::stat &buf) {
   res.real_size_ = buf.st_blocks * 512;
   res.is_dir_ = (buf.st_mode & S_IFMT) == S_IFDIR;
   res.is_reg_ = (buf.st_mode & S_IFMT) == S_IFREG;
+  res.is_symbolic_link_ = (buf.st_mode & S_IFMT) == S_IFLNK;
   return res;
 }
 
@@ -290,6 +292,8 @@ Result<MemStat> mem_stat() {
     return Status::Error("Call to GetProcessMemoryInfo failed");
   }
 
+  // Working set = all non-virtual memory in RAM, including memory-mapped files
+  // PrivateUsage = Commit charge = all non-virtual memory in RAM and swap file, but not in memory-mapped files
   MemStat res;
   res.resident_size_ = counters.WorkingSetSize;
   res.resident_size_peak_ = counters.PeakWorkingSetSize;

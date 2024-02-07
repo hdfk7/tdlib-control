@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -87,9 +87,7 @@ class TlObject {
   virtual ~TlObject() = default;
 };
 
-/**
- * A smart wrapper to store a pointer to a TL-object.
- */
+/// @cond UNDOCUMENTED
 namespace tl {
 
 template <class T>
@@ -99,8 +97,8 @@ class unique_ptr {
   using element_type = T;
 
   unique_ptr() noexcept = default;
-  unique_ptr(const unique_ptr &other) = delete;
-  unique_ptr &operator=(const unique_ptr &other) = delete;
+  unique_ptr(const unique_ptr &) = delete;
+  unique_ptr &operator=(const unique_ptr &) = delete;
   unique_ptr(unique_ptr &&other) noexcept : ptr_(other.release()) {
   }
   unique_ptr &operator=(unique_ptr &&other) noexcept {
@@ -177,6 +175,11 @@ bool operator!=(const unique_ptr<T> &p, std::nullptr_t) {
 }
 
 }  // namespace tl
+/// @endcond
+
+/**
+ * A smart wrapper to store a pointer to a TL-object.
+ */
 template <class Type>
 using tl_object_ptr = tl::unique_ptr<Type>;
 
@@ -184,11 +187,11 @@ using tl_object_ptr = tl::unique_ptr<Type>;
  * A function to create a dynamically allocated TL-object. Can be treated as an analogue of std::make_unique.
  * Usage example:
  * \code
- * auto get_authorization_state_request = td::make_tl_object<td::td_api::getAuthorizationState>();
+ * auto get_me_request = td::make_tl_object<td::td_api::getMe>();
  * auto message_text = td::make_tl_object<td::td_api::formattedText>("Hello, world!!!",
- *                     std::vector<td::tl_object_ptr<td::td_api::textEntity>>());
- * auto send_message_request = td::make_tl_object<td::td_api::sendMessage>(chat_id, 0, 0, nullptr, nullptr,
- *      td::make_tl_object<td::td_api::inputMessageText>(std::move(message_text), false, true));
+ *                     td::td_api::array<td::tl_object_ptr<td::td_api::textEntity>>());
+ * auto send_message_request = td::make_tl_object<td::td_api::sendMessage>(chat_id, 0, nullptr, nullptr, nullptr,
+ *      td::make_tl_object<td::td_api::inputMessageText>(std::move(message_text), nullptr, true));
  * \endcode
  *
  * \tparam Type Type of the TL-object to construct.
@@ -196,7 +199,7 @@ using tl_object_ptr = tl::unique_ptr<Type>;
  * \return Wrapped pointer to the created TL-object.
  */
 template <class Type, class... Args>
-tl_object_ptr<Type> make_tl_object(Args &&... args) {
+tl_object_ptr<Type> make_tl_object(Args &&...args) {
   return tl_object_ptr<Type>(new Type(std::forward<Args>(args)...));
 }
 

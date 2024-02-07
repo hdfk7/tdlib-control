@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -16,6 +16,8 @@
 
 namespace td {
 
+class Td;
+
 class DialogLocation {
   Location location_;
   string address_;
@@ -28,7 +30,7 @@ class DialogLocation {
  public:
   DialogLocation() = default;
 
-  explicit DialogLocation(telegram_api::object_ptr<telegram_api::ChannelLocation> &&channel_location_ptr);
+  DialogLocation(Td *td, telegram_api::object_ptr<telegram_api::ChannelLocation> &&channel_location_ptr);
 
   explicit DialogLocation(td_api::object_ptr<td_api::chatLocation> &&chat_location);
 

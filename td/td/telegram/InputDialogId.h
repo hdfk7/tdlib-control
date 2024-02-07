@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -10,9 +10,8 @@
 #include "td/telegram/telegram_api.h"
 
 #include "td/utils/common.h"
+#include "td/utils/FlatHashSet.h"
 #include "td/utils/StringBuilder.h"
-
-#include <unordered_set>
 
 namespace td {
 
@@ -23,14 +22,17 @@ class InputDialogId {
  public:
   InputDialogId() = default;
 
-  explicit InputDialogId(DialogId dialog_id) : dialog_id(dialog_id) {
+  explicit constexpr InputDialogId(DialogId dialog_id) : dialog_id(dialog_id) {
   }
+
+  explicit InputDialogId(const telegram_api::object_ptr<telegram_api::InputUser> &input_user);
 
   explicit InputDialogId(const tl_object_ptr<telegram_api::InputPeer> &input_peer);
 
-  static vector<InputDialogId> get_input_dialog_ids(
-      const vector<tl_object_ptr<telegram_api::InputPeer>> &input_peers,
-      std::unordered_set<DialogId, DialogIdHash> *added_dialog_ids = nullptr);
+  static vector<InputDialogId> get_input_dialog_ids(const vector<tl_object_ptr<telegram_api::InputPeer>> &input_peers,
+                                                    FlatHashSet<DialogId, DialogIdHash> *added_dialog_ids = nullptr);
+
+  static vector<DialogId> get_dialog_ids(const vector<InputDialogId> &input_dialog_ids);
 
   static vector<telegram_api::object_ptr<telegram_api::InputDialogPeer>> get_input_dialog_peers(
       const vector<InputDialogId> &input_dialog_ids);
@@ -41,6 +43,8 @@ class InputDialogId {
   static bool are_equivalent(const vector<InputDialogId> &lhs, const vector<InputDialogId> &rhs);
 
   static bool contains(const vector<InputDialogId> &input_dialog_ids, DialogId dialog_id);
+
+  static bool remove(vector<InputDialogId> &input_dialog_ids, DialogId dialog_id);
 
   bool operator==(const InputDialogId &other) const {
     return dialog_id == other.dialog_id && access_hash == other.access_hash;

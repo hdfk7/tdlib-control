@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -10,27 +10,20 @@
 #include "td/actor/impl/Scheduler-decl.h"
 
 #include "td/utils/common.h"
-#include "td/utils/format.h"
 #include "td/utils/Heap.h"
 #include "td/utils/logging.h"
-#include "td/utils/MpscPollableQueue.h"
 #include "td/utils/ObjectPool.h"
 #include "td/utils/port/detail/PollableFd.h"
 #include "td/utils/port/PollFlags.h"
+#include "td/utils/Promise.h"
 #include "td/utils/Slice.h"
 #include "td/utils/Time.h"
 
 #include <atomic>
-#include <memory>
 #include <tuple>
 #include <utility>
 
 namespace td {
-
-/*** ServiceActor ***/
-inline void Scheduler::ServiceActor::set_queue(std::shared_ptr<MpscPollableQueue<EventFull>> queues) {
-  inbound_ = std::move(queues);
-}
 
 /*** EventGuard ***/
 class EventGuard {
@@ -41,10 +34,10 @@ class EventGuard {
     return event_context_.flags == 0;
   }
 
-  EventGuard(const EventGuard &other) = delete;
-  EventGuard &operator=(const EventGuard &other) = delete;
-  EventGuard(EventGuard &&other) = delete;
-  EventGuard &operator=(EventGuard &&other) = delete;
+  EventGuard(const EventGuard &) = delete;
+  EventGuard &operator=(const EventGuard &) = delete;
+  EventGuard(EventGuard &&) = delete;
+  EventGuard &operator=(EventGuard &&) = delete;
   ~EventGuard();
 
  private:
@@ -65,10 +58,6 @@ inline SchedulerGuard Scheduler::get_const_guard() {
   return SchedulerGuard(this, false);
 }
 
-inline void Scheduler::init() {
-  init(0, {}, nullptr);
-}
-
 inline int32 Scheduler::sched_id() const {
   return sched_id_;
 }
@@ -77,12 +66,12 @@ inline int32 Scheduler::sched_count() const {
 }
 
 template <class ActorT, class... Args>
-ActorOwn<ActorT> Scheduler::create_actor(Slice name, Args &&... args) {
+ActorOwn<ActorT> Scheduler::create_actor(Slice name, Args &&...args) {
   return register_actor_impl(name, new ActorT(std::forward<Args>(args)...), Actor::Deleter::Destroy, sched_id_);
 }
 
 template <class ActorT, class... Args>
-ActorOwn<ActorT> Scheduler::create_actor_on_scheduler(Slice name, int32 sched_id, Args &&... args) {
+ActorOwn<ActorT> Scheduler::create_actor_on_scheduler(Slice name, int32 sched_id, Args &&...args) {
   return register_actor_impl(name, new ActorT(std::forward<Args>(args)...), Actor::Deleter::Destroy, sched_id);
 }
 
@@ -108,22 +97,21 @@ ActorOwn<ActorT> Scheduler::register_actor_impl(Slice name, ActorT *actor_ptr, A
   LOG_CHECK(sched_id == sched_id_ || (0 <= sched_id && sched_id < static_cast<int32>(outbound_queues_.size())))
       << sched_id;
   auto info = actor_info_pool_->create_empty();
-  VLOG(actor) << "Create actor: " << tag("name", name) << tag("ptr", *info) << tag("context", context())
-              << tag("this", this) << tag("actor_count", actor_count_);
   actor_count_++;
   auto weak_info = info.get_weak();
   auto actor_info = info.get();
   actor_info->init(sched_id_, name, std::move(info), static_cast<Actor *>(actor_ptr), deleter,
-                   ActorTraits<ActorT>::is_lite);
+                   ActorTraits<ActorT>::need_context, ActorTraits<ActorT>::need_start_up);
+  VLOG(actor) << "Create actor " << *actor_info << " (actor_count = " << actor_count_ << ')';
 
   ActorId<ActorT> actor_id = weak_info->actor_id(actor_ptr);
   if (sched_id != sched_id_) {
-    send<ActorSendType::LaterWeak>(actor_id, Event::start());
+    send<ActorSendType::Later>(actor_id, Event::start());
     do_migrate_actor(actor_info, sched_id);
   } else {
     pending_actors_list_.put(weak_info->get_list_node());
-    if (!ActorTraits<ActorT>::is_lite) {
-      send<ActorSendType::LaterWeak>(actor_id, Event::start());
+    if (ActorTraits<ActorT>::need_start_up) {
+      send<ActorSendType::Later>(actor_id, Event::start());
     }
   }
 
@@ -139,8 +127,7 @@ ActorOwn<ActorT> Scheduler::register_existing_actor(unique_ptr<ActorT> actor_ptr
 }
 
 inline void Scheduler::destroy_actor(ActorInfo *actor_info) {
-  VLOG(actor) << "Destroy actor: " << tag("name", *actor_info) << tag("ptr", actor_info)
-              << tag("actor_count", actor_count_);
+  VLOG(actor) << "Destroy actor " << *actor_info << " (actor_count = " << actor_count_ << ')';
 
   LOG_CHECK(actor_info->migrate_dest() == sched_id_) << actor_info->migrate_dest() << " " << sched_id_;
   cancel_actor_timeout(actor_info);
@@ -171,7 +158,7 @@ void Scheduler::flush_mailbox(ActorInfo *actor_info, const RunFuncT &run_func, c
   mailbox.erase(mailbox.begin(), mailbox.begin() + i);
 }
 
-inline void Scheduler::send_to_scheduler(int32 sched_id, const ActorId<> &actor_id, Event &&event) {
+inline void Scheduler::send_to_scheduler(int32 sched_id, const ActorId<Actor> &actor_id, Event &&event) {
   if (sched_id == sched_id_) {
     ActorInfo *actor_info = actor_id.get_actor_info();
     pending_events_[actor_info].push_back(std::move(event));
@@ -180,12 +167,24 @@ inline void Scheduler::send_to_scheduler(int32 sched_id, const ActorId<> &actor_
   }
 }
 
-inline void Scheduler::before_tail_send(const ActorId<> &actor_id) {
-  // TODO
+template <class T>
+void Scheduler::destroy_on_scheduler(int32 sched_id, T &value) {
+  if (!value.empty()) {
+    destroy_on_scheduler_impl(sched_id, PromiseCreator::lambda([value = std::move(value)](Unit) {
+                                // destroy value
+                              }));
+  }
 }
 
-inline void Scheduler::inc_wait_generation() {
-  wait_generation_ += 2;
+template <class... ArgsT>
+void Scheduler::destroy_on_scheduler(int32 sched_id, ArgsT &...values) {
+  destroy_on_scheduler_impl(sched_id, PromiseCreator::lambda([values = std::make_tuple(std::move(values)...)](Unit) {
+                              // destroy values
+                            }));
+}
+
+inline void Scheduler::before_tail_send(const ActorId<> &actor_id) {
+  // TODO
 }
 
 template <ActorSendType send_type, class RunFuncT, class EventFuncT>
@@ -203,19 +202,12 @@ void Scheduler::send_impl(const ActorId<> &actor_id, const RunFuncT &run_func, c
   CHECK(has_guard_ || !on_current_sched);
 
   if (likely(send_type == ActorSendType::Immediate && on_current_sched && !actor_info->is_running() &&
-             !actor_info->must_wait(wait_generation_))) {  // run immediately
-    if (likely(actor_info->mailbox_.empty())) {
-      EventGuard guard(this, actor_info);
-      run_func(actor_info);
-    } else {
-      flush_mailbox(actor_info, &run_func, &event_func);
-    }
+             actor_info->mailbox_.empty())) {  // run immediately
+    EventGuard guard(this, actor_info);
+    run_func(actor_info);
   } else {
     if (on_current_sched) {
       add_to_mailbox(actor_info, event_func());
-      if (send_type == ActorSendType::Later) {
-        actor_info->set_wait_generation(wait_generation_);
-      }
     } else {
       send_to_scheduler(actor_sched_id, actor_id, event_func());
     }
@@ -223,15 +215,15 @@ void Scheduler::send_impl(const ActorId<> &actor_id, const RunFuncT &run_func, c
 }
 
 template <ActorSendType send_type, class EventT>
-void Scheduler::send_lambda(ActorRef actor_ref, EventT &&lambda) {
+void Scheduler::send_lambda(ActorRef actor_ref, EventT &&func) {
   return send_impl<send_type>(
       actor_ref.get(),
       [&](ActorInfo *actor_info) {
         event_context_ptr_->link_token = actor_ref.token();
-        lambda();
+        func();
       },
       [&] {
-        auto event = Event::lambda(std::forward<EventT>(lambda));
+        auto event = Event::from_lambda(std::forward<EventT>(func));
         event.set_link_token(actor_ref.token());
         return event;
       });
@@ -276,7 +268,7 @@ inline void Scheduler::yield_actor(Actor *actor) {
   yield_actor(actor->get_info());
 }
 inline void Scheduler::yield_actor(ActorInfo *actor_info) {
-  send<ActorSendType::LaterWeak>(actor_info->actor_id(), Event::yield());
+  send<ActorSendType::Later>(actor_info->actor_id(), Event::yield());
 }
 
 inline void Scheduler::stop_actor(Actor *actor) {
@@ -299,8 +291,8 @@ inline void Scheduler::finish_migrate_actor(Actor *actor) {
   register_migrated_actor(actor->get_info());
 }
 
-inline bool Scheduler::has_actor_timeout(const Actor *actor) const {
-  return has_actor_timeout(actor->get_info());
+inline double Scheduler::get_actor_timeout(const Actor *actor) const {
+  return get_actor_timeout(actor->get_info());
 }
 inline void Scheduler::set_actor_timeout_in(Actor *actor, double timeout) {
   set_actor_timeout_in(actor->get_info(), timeout);
@@ -310,11 +302,6 @@ inline void Scheduler::set_actor_timeout_at(Actor *actor, double timeout_at) {
 }
 inline void Scheduler::cancel_actor_timeout(Actor *actor) {
   cancel_actor_timeout(actor->get_info());
-}
-
-inline bool Scheduler::has_actor_timeout(const ActorInfo *actor_info) const {
-  const HeapNode *heap_node = actor_info->get_heap_node();
-  return heap_node->in_heap();
 }
 
 inline void Scheduler::cancel_actor_timeout(ActorInfo *actor_info) {
@@ -342,17 +329,6 @@ inline void Scheduler::wakeup() {
 #endif
 }
 
-inline Timestamp Scheduler::run_events() {
-  Timestamp res;
-  VLOG(actor) << "Run events " << sched_id_ << " " << tag("pending", pending_events_.size())
-              << tag("actors", actor_count_);
-  do {
-    run_mailbox();
-    res = run_timeout();
-  } while (!ready_actors_list_.empty());
-  return res;
-}
-
 inline void Scheduler::run(Timestamp timeout) {
   auto guard = get_guard();
   run_no_guard(timeout);
@@ -360,12 +336,12 @@ inline void Scheduler::run(Timestamp timeout) {
 
 /*** Interface to current scheduler ***/
 template <class ActorT, class... Args>
-ActorOwn<ActorT> create_actor(Slice name, Args &&... args) {
+ActorOwn<ActorT> create_actor(Slice name, Args &&...args) {
   return Scheduler::instance()->create_actor<ActorT>(name, std::forward<Args>(args)...);
 }
 
 template <class ActorT, class... Args>
-ActorOwn<ActorT> create_actor_on_scheduler(Slice name, int32 sched_id, Args &&... args) {
+ActorOwn<ActorT> create_actor_on_scheduler(Slice name, int32 sched_id, Args &&...args) {
   return Scheduler::instance()->create_actor_on_scheduler<ActorT>(name, sched_id, std::forward<Args>(args)...);
 }
 
@@ -382,10 +358,6 @@ ActorOwn<ActorT> register_actor(Slice name, unique_ptr<ActorT> actor_ptr, int32 
 template <class ActorT>
 ActorOwn<ActorT> register_existing_actor(unique_ptr<ActorT> actor_ptr) {
   return Scheduler::instance()->register_existing_actor(std::move(actor_ptr));
-}
-
-inline void yield_scheduler() {
-  Scheduler::instance()->yield();
 }
 
 }  // namespace td

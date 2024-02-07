@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -19,10 +19,10 @@ namespace td {
 class BigNumContext {
  public:
   BigNumContext();
-  BigNumContext(const BigNumContext &other) = delete;
-  BigNumContext &operator=(const BigNumContext &other) = delete;
-  BigNumContext(BigNumContext &&other);
-  BigNumContext &operator=(BigNumContext &&other);
+  BigNumContext(const BigNumContext &) = delete;
+  BigNumContext &operator=(const BigNumContext &) = delete;
+  BigNumContext(BigNumContext &&other) noexcept;
+  BigNumContext &operator=(BigNumContext &&other) noexcept;
   ~BigNumContext();
 
  private:
@@ -37,8 +37,8 @@ class BigNum {
   BigNum();
   BigNum(const BigNum &other);
   BigNum &operator=(const BigNum &other);
-  BigNum(BigNum &&other);
-  BigNum &operator=(BigNum &&other);
+  BigNum(BigNum &&other) noexcept;
+  BigNum &operator=(BigNum &&other) noexcept;
   ~BigNum();
 
   static BigNum from_binary(Slice str);

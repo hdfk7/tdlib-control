@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -14,7 +14,7 @@
 #include <utility>
 
 namespace td {
-// It is draft object pool implementaion
+// It is draft object pool implementation
 //
 // Compared with std::shared_ptr:
 // + WeakPtr are much faster. Just pointer copy. No barriers, no atomics.
@@ -43,10 +43,9 @@ class ObjectPool {
     // Pattern of usage: 1. Read an object 2. Check if read was valid via is_alive
     //
     // It is not very usual case of acquire/release use.
-    // Instead of publishing an object via some flag we do the opposite.
-    // We publish new generation via destruction of the data.
+    // We publish new generation via destruction of the data instead of publishing the object via some flag.
     // In usual case if we see a flag, then we are able to use an object.
-    // In our case if we have used an object and it is already invalid, then generation will mismatch
+    // In our case if we have used an object and it is already invalid, then generation will mismatch.
     bool is_alive() const {
       if (!storage_) {
         return false;
@@ -84,11 +83,11 @@ class ObjectPool {
     OwnerPtr() = default;
     OwnerPtr(const OwnerPtr &) = delete;
     OwnerPtr &operator=(const OwnerPtr &) = delete;
-    OwnerPtr(OwnerPtr &&other) : storage_(other.storage_), parent_(other.parent_) {
+    OwnerPtr(OwnerPtr &&other) noexcept : storage_(other.storage_), parent_(other.parent_) {
       other.storage_ = nullptr;
       other.parent_ = nullptr;
     }
-    OwnerPtr &operator=(OwnerPtr &&other) {
+    OwnerPtr &operator=(OwnerPtr &&other) noexcept {
       if (this != &other) {
         storage_ = other.storage_;
         parent_ = other.parent_;
@@ -156,7 +155,7 @@ class ObjectPool {
   };
 
   template <class... ArgsT>
-  OwnerPtr create(ArgsT &&... args) {
+  OwnerPtr create(ArgsT &&...args) {
     Storage *storage = get_storage();
     storage->init_data(std::forward<ArgsT>(args)...);
     return OwnerPtr(storage, this);
@@ -180,8 +179,8 @@ class ObjectPool {
   ObjectPool() = default;
   ObjectPool(const ObjectPool &) = delete;
   ObjectPool &operator=(const ObjectPool &) = delete;
-  ObjectPool(ObjectPool &&other) = delete;
-  ObjectPool &operator=(ObjectPool &&other) = delete;
+  ObjectPool(ObjectPool &&) = delete;
+  ObjectPool &operator=(ObjectPool &&) = delete;
   ~ObjectPool() {
     while (head_.load()) {
       auto to_delete = head_.load();
@@ -201,7 +200,7 @@ class ObjectPool {
     std::atomic<int32> generation{1};
 
     template <class... ArgsT>
-    void init_data(ArgsT &&... args) {
+    void init_data(ArgsT &&...args) {
       // new  (&data) DataT(std::forward<ArgsT>(args)...);
       data = DataT(std::forward<ArgsT>(args)...);
     }
@@ -216,7 +215,7 @@ class ObjectPool {
   std::atomic<Storage *> head_{static_cast<Storage *>(nullptr)};
   bool check_empty_flag_ = false;
 
-  // TODO(perf): allocation Storages in chunks? Anyway we won't be able to release them.
+  // TODO(perf): allocation Storages in chunks? Anyway, we won't be able to release them.
   // TODO(perf): memory order
   // TODO(perf): use another non lockfree list for release on the same thread
   // only one thread, so no aba problem

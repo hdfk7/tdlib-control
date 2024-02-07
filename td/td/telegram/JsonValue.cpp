@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -7,7 +7,9 @@
 #include "td/telegram/JsonValue.h"
 
 #include "td/telegram/misc.h"
+#include "td/telegram/telegram_api.h"
 
+#include "td/utils/algorithm.h"
 #include "td/utils/JsonBuilder.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
@@ -16,14 +18,6 @@
 #include <utility>
 
 namespace td {
-
-static td_api::object_ptr<td_api::JsonValue> get_json_value_object(const JsonValue &json_value);
-
-static td_api::object_ptr<td_api::jsonObjectMember> get_json_value_member_object(
-    const std::pair<MutableSlice, JsonValue> &json_value_member) {
-  return td_api::make_object<td_api::jsonObjectMember>(json_value_member.first.str(),
-                                                       get_json_value_object(json_value_member.second));
-}
 
 static td_api::object_ptr<td_api::JsonValue> get_json_value_object(const JsonValue &json_value) {
   switch (json_value.type()) {
@@ -37,9 +31,13 @@ static td_api::object_ptr<td_api::JsonValue> get_json_value_object(const JsonVal
       return td_api::make_object<td_api::jsonValueString>(json_value.get_string().str());
     case JsonValue::Type::Array:
       return td_api::make_object<td_api::jsonValueArray>(transform(json_value.get_array(), get_json_value_object));
-    case JsonValue::Type::Object:
-      return td_api::make_object<td_api::jsonValueObject>(
-          transform(json_value.get_object(), get_json_value_member_object));
+    case JsonValue::Type::Object: {
+      vector<td_api::object_ptr<td_api::jsonObjectMember>> members;
+      json_value.get_object().foreach([&members](Slice name, const JsonValue &value) {
+        members.push_back(td_api::make_object<td_api::jsonObjectMember>(name.str(), get_json_value_object(value)));
+      });
+      return td_api::make_object<td_api::jsonValueObject>(std::move(members));
+    }
     default:
       UNREACHABLE();
       return nullptr;
@@ -134,7 +132,7 @@ tl_object_ptr<telegram_api::JSONValue> convert_json_value(td_api::object_ptr<td_
 
 namespace {
 
-class JsonableJsonValue : public Jsonable {
+class JsonableJsonValue final : public Jsonable {
  public:
   explicit JsonableJsonValue(const td_api::JsonValue *json_value) : json_value_(json_value) {
   }
@@ -196,6 +194,54 @@ class JsonableJsonValue : public Jsonable {
 
 string get_json_string(const td_api::JsonValue *json_value) {
   return json_encode<string>(JsonableJsonValue(json_value));
+}
+
+bool get_json_value_bool(telegram_api::object_ptr<telegram_api::JSONValue> &&json_value, Slice name) {
+  CHECK(json_value != nullptr);
+  if (json_value->get_id() == telegram_api::jsonBool::ID) {
+    return static_cast<const telegram_api::jsonBool *>(json_value.get())->value_;
+  }
+  LOG(ERROR) << "Expected Boolean as " << name << ", but found " << to_string(json_value);
+  return false;
+}
+
+int32 get_json_value_int(telegram_api::object_ptr<telegram_api::JSONValue> &&json_value, Slice name) {
+  CHECK(json_value != nullptr);
+  if (json_value->get_id() == telegram_api::jsonNumber::ID) {
+    return static_cast<int32>(static_cast<const telegram_api::jsonNumber *>(json_value.get())->value_);
+  }
+  LOG(ERROR) << "Expected Integer as " << name << ", but found " << to_string(json_value);
+  return 0;
+}
+
+int64 get_json_value_long(telegram_api::object_ptr<telegram_api::JSONValue> &&json_value, Slice name) {
+  CHECK(json_value != nullptr);
+  if (json_value->get_id() == telegram_api::jsonString::ID) {
+    return to_integer<int64>(static_cast<const telegram_api::jsonString *>(json_value.get())->value_);
+  }
+  if (json_value->get_id() == telegram_api::jsonNumber::ID) {
+    return static_cast<int64>(static_cast<const telegram_api::jsonNumber *>(json_value.get())->value_);
+  }
+  LOG(ERROR) << "Expected Long as " << name << ", but found " << to_string(json_value);
+  return 0;
+}
+
+double get_json_value_double(telegram_api::object_ptr<telegram_api::JSONValue> &&json_value, Slice name) {
+  CHECK(json_value != nullptr);
+  if (json_value->get_id() == telegram_api::jsonNumber::ID) {
+    return static_cast<const telegram_api::jsonNumber *>(json_value.get())->value_;
+  }
+  LOG(ERROR) << "Expected Double as " << name << ", but found " << to_string(json_value);
+  return 0.0;
+}
+
+string get_json_value_string(telegram_api::object_ptr<telegram_api::JSONValue> &&json_value, Slice name) {
+  CHECK(json_value != nullptr);
+  if (json_value->get_id() == telegram_api::jsonString::ID) {
+    return std::move(static_cast<telegram_api::jsonString *>(json_value.get())->value_);
+  }
+  LOG(ERROR) << "Expected String as " << name << ", but found " << to_string(json_value);
+  return string();
 }
 
 }  // namespace td

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -13,6 +13,7 @@
 #include "td/utils/port/FileFd.h"
 #include "td/utils/Random.h"
 #include "td/utils/SharedSlice.h"
+#include "td/utils/SliceBuilder.h"
 
 namespace td {
 namespace secure_storage {
@@ -23,7 +24,7 @@ Result<ValueHash> ValueHash::create(Slice data) {
   if (data.size() != ::td::as_slice(hash).size()) {
     return Status::Error(PSLICE() << "Wrong hash size " << data.size());
   }
-  ::td::as_slice(hash).copy_from(data);
+  ::td::as_mutable_slice(hash).copy_from(data);
   return ValueHash{hash};
 }
 
@@ -40,17 +41,15 @@ static AesCbcState calc_aes_cbc_state_hash(Slice hash) {
 AesCbcState calc_aes_cbc_state_pbkdf2(Slice secret, Slice salt) {
   LOG(INFO) << "Begin AES CBC state calculation";
   UInt<512> hash;
-  auto hash_slice = as_slice(hash);
-  pbkdf2_sha512(secret, salt, 100000, hash_slice);
-  return calc_aes_cbc_state_hash(hash_slice);
+  pbkdf2_sha512(secret, salt, 100000, as_mutable_slice(hash));
+  return calc_aes_cbc_state_hash(as_slice(hash));
 }
 
 AesCbcState calc_aes_cbc_state_sha512(Slice seed) {
   LOG(INFO) << "Begin AES CBC state calculation";
   UInt<512> hash;
-  auto hash_slice = as_slice(hash);
-  sha512(seed, hash_slice);
-  return calc_aes_cbc_state_hash(hash_slice);
+  sha512(seed, as_mutable_slice(hash));
+  return calc_aes_cbc_state_hash(as_slice(hash));
 }
 
 template <class F>
@@ -71,30 +70,30 @@ Result<ValueHash> calc_value_hash(const DataView &data_view) {
     return Status::OK();
   }));
   UInt256 res;
-  state.extract(as_slice(res));
+  state.extract(as_mutable_slice(res));
   return ValueHash{res};
 }
 
 ValueHash calc_value_hash(Slice data) {
   UInt256 res;
-  sha256(data, as_slice(res));
+  sha256(data, as_mutable_slice(res));
   return ValueHash{res};
 }
 
 BufferSlice gen_random_prefix(int64 data_size) {
   BufferSlice buff(narrow_cast<size_t>(((32 + 15 + data_size) & -16) - data_size));
-  Random::secure_bytes(buff.as_slice());
-  buff.as_slice()[0] = narrow_cast<uint8>(buff.size());
+  Random::secure_bytes(buff.as_mutable_slice());
+  buff.as_mutable_slice()[0] = narrow_cast<uint8>(buff.size());
   CHECK((buff.size() + data_size) % 16 == 0);
   return buff;
 }
 
-class FileDataView : public DataView {
+class FileDataView final : public DataView {
  public:
   FileDataView(FileFd &fd, int64 size);
 
-  int64 size() const override;
-  Result<BufferSlice> pread(int64 offset, int64 size) const override;
+  int64 size() const final;
+  Result<BufferSlice> pread(int64 offset, int64 size) const final;
 
  private:
   FileFd &fd_;
@@ -110,7 +109,7 @@ int64 FileDataView::size() const {
 
 Result<BufferSlice> FileDataView::pread(int64 offset, int64 size) const {
   auto slice = BufferSlice(narrow_cast<size_t>(size));
-  TRY_RESULT(actual_size, fd_.pread(slice.as_slice(), offset));
+  TRY_RESULT(actual_size, fd_.pread(slice.as_mutable_slice(), offset));
   if (static_cast<int64>(actual_size) != size) {
     return Status::Error("Not enough data in file");
   }
@@ -165,8 +164,8 @@ Result<BufferSlice> ConcatDataView::pread(int64 offset, int64 size) const {
   }
 
   BufferSlice res(a.size() + b.size());
-  res.as_slice().copy_from(a.as_slice());
-  res.as_slice().substr(a.size()).copy_from(b.as_slice());
+  res.as_mutable_slice().copy_from(a.as_slice());
+  res.as_mutable_slice().substr(a.size()).copy_from(b.as_slice());
   return std::move(res);
 }
 
@@ -194,20 +193,20 @@ Result<Secret> Secret::create(Slice secret) {
     return Status::Error(PSLICE() << "Wrong checksum " << checksum);
   }
   UInt256 res;
-  ::td::as_slice(res).copy_from(secret);
+  ::td::as_mutable_slice(res).copy_from(secret);
 
   UInt256 secret_sha256;
-  sha256(secret, ::td::as_slice(secret_sha256));
+  sha256(secret, ::td::as_mutable_slice(secret_sha256));
   int64 hash = as<int64>(secret_sha256.raw);
   return Secret{res, hash};
 }
 
 Secret Secret::create_new() {
   UInt256 secret;
-  auto secret_slice = ::td::as_slice(secret);
+  auto secret_slice = ::td::as_mutable_slice(secret);
   Random::secure_bytes(secret_slice);
   auto checksum_diff = secret_checksum(secret_slice);
-  uint8 new_byte = static_cast<uint8>((static_cast<uint32>(secret_slice.ubegin()[0]) + checksum_diff) % 255);
+  auto new_byte = static_cast<uint8>((static_cast<uint32>(secret_slice.ubegin()[0]) + checksum_diff) % 255);
   secret_slice.ubegin()[0] = new_byte;
   return create(secret_slice).move_as_ok();
 }
@@ -238,7 +237,7 @@ EncryptedSecret Secret::encrypt(Slice key, Slice salt, EnryptionAlgorithm algori
   }();
 
   UInt256 res;
-  aes_cbc_state.encrypt(as_slice(), ::td::as_slice(res));
+  aes_cbc_state.encrypt(as_slice(), ::td::as_mutable_slice(res));
   return EncryptedSecret::create(::td::as_slice(res)).move_as_ok();
 }
 
@@ -250,7 +249,7 @@ Result<EncryptedSecret> EncryptedSecret::create(Slice encrypted_secret) {
     return Status::Error("Wrong encrypted secret size");
   }
   UInt256 res;
-  ::td::as_slice(res).copy_from(encrypted_secret);
+  ::td::as_mutable_slice(res).copy_from(encrypted_secret);
   return EncryptedSecret{res};
 }
 
@@ -268,7 +267,7 @@ Result<Secret> EncryptedSecret::decrypt(Slice key, Slice salt, EnryptionAlgorith
   }();
 
   UInt256 res;
-  aes_cbc_state.decrypt(::td::as_slice(encrypted_secret_), ::td::as_slice(res));
+  aes_cbc_state.decrypt(::td::as_slice(encrypted_secret_), ::td::as_mutable_slice(res));
   return Secret::create(::td::as_slice(res));
 }
 
@@ -290,7 +289,7 @@ Result<BufferSlice> Decryptor::append(BufferSlice data) {
   if (data.size() % 16 != 0) {
     return Status::Error("Part size must be divisible by 16");
   }
-  aes_cbc_state_.decrypt(data.as_slice(), data.as_slice());
+  aes_cbc_state_.decrypt(data.as_slice(), data.as_mutable_slice());
   sha256_state_.feed(data.as_slice());
   if (!skipped_prefix_) {
     to_skip_ = data.as_slice().ubegin()[0];
@@ -313,7 +312,7 @@ Result<ValueHash> Decryptor::finish() {
   }
 
   UInt256 res;
-  sha256_state_.extract(as_slice(res), true);
+  sha256_state_.extract(as_mutable_slice(res), true);
   return ValueHash{res};
 }
 
@@ -333,7 +332,7 @@ Result<BufferSlice> Encryptor::pread(int64 offset, int64 size) const {
     return Status::Error("Part size must be divisible by 16");
   }
   TRY_RESULT(part, data_view_.pread(offset, size));
-  aes_cbc_state_.encrypt(part.as_slice(), part.as_slice());
+  aes_cbc_state_.encrypt(part.as_slice(), part.as_mutable_slice());
   current_offset_ += size;
   return std::move(part);
 }
@@ -363,7 +362,7 @@ Result<BufferSlice> decrypt_value(const Secret &secret, const ValueHash &hash, S
   return std::move(decrypted_value);
 }
 
-Result<ValueHash> encrypt_file(const Secret &secret, std::string src, std::string dest) {
+Result<ValueHash> encrypt_file(const Secret &secret, const string &src, const string &dest) {
   TRY_RESULT(src_file, FileFd::open(src, FileFd::Flags::Read));
   TRY_RESULT(dest_file, FileFd::open(dest, FileFd::Flags::Truncate | FileFd::Flags::Write | FileFd::Create));
   TRY_RESULT(src_file_size, src_file.get_size());
@@ -381,7 +380,7 @@ Result<ValueHash> encrypt_file(const Secret &secret, std::string src, std::strin
   return std::move(hash);
 }
 
-Status decrypt_file(const Secret &secret, const ValueHash &hash, std::string src, std::string dest) {
+Status decrypt_file(const Secret &secret, const ValueHash &hash, const string &src, const string &dest) {
   TRY_RESULT(src_file, FileFd::open(src, FileFd::Flags::Read));
   TRY_RESULT(dest_file, FileFd::open(dest, FileFd::Flags::Truncate | FileFd::Flags::Write | FileFd::Create));
   TRY_RESULT(src_file_size, src_file.get_size());

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -74,7 +74,7 @@ static void set_handler(struct sigaction &act, decltype(act.sa_sigaction) handle
   act.sa_flags |= SA_SIGINFO;
 }
 template <class F>
-static Status set_signal_handler_impl(vector<int> signals, F func) {
+static Status set_signal_handler_impl(vector<int> &&signals, F func) {
   struct sigaction act;
   std::memset(&act, '\0', sizeof(act));
 
@@ -123,7 +123,7 @@ static void signal_handler_func(int sig) {
   handler(sig);
 }
 
-static Status set_signal_handler_impl(vector<int> signals, void (*func)(int sig)) {
+static Status set_signal_handler_impl(vector<int> &&signals, void (*func)(int sig)) {
   for (auto signal : signals) {
     CHECK(0 <= signal && signal < NSIG);
     if (func != SIG_IGN && func != SIG_DFL) {
@@ -191,10 +191,10 @@ Status set_extended_signal_handler(SignalType type, extended_signal_handler func
   return set_signal_handler_impl(std::move(signals), siginfo_handler);
 }
 
-Status set_runtime_signal_handler(int runtime_signal_number, void (*func)(int)) {
+Status set_real_time_signal_handler(int real_time_signal_number, void (*func)(int)) {
 #ifdef SIGRTMIN
-  CHECK(SIGRTMIN + runtime_signal_number <= SIGRTMAX);
-  return set_signal_handler_impl({SIGRTMIN + runtime_signal_number}, func == nullptr ? SIG_DFL : func);
+  CHECK(SIGRTMIN + real_time_signal_number <= SIGRTMAX);
+  return set_signal_handler_impl({SIGRTMIN + real_time_signal_number}, func == nullptr ? SIG_DFL : func);
 #else
   return Status::OK();
 #endif
@@ -296,7 +296,7 @@ void signal_safe_write_signal_number(int sig, bool add_header) {
 }
 
 void signal_safe_write_pointer(void *p, bool add_header) {
-  std::uintptr_t addr = reinterpret_cast<std::uintptr_t>(p);
+  auto addr = reinterpret_cast<std::uintptr_t>(p);
   char buf[100];
   char *end = buf + sizeof(buf);
   char *ptr = end;

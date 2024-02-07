@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -39,7 +39,7 @@ void TransparentProxy::tear_down() {
   if (callback_) {
     if (!fd_.input_buffer().empty()) {
       LOG(ERROR) << "Have " << fd_.input_buffer().size() << " unread bytes";
-      callback_->set_result(Status::Error("Proxy has sent to much data"));
+      callback_->set_result(Status::Error("Proxy has sent too many data"));
     } else {
       callback_->set_result(std::move(fd_));
     }
@@ -48,7 +48,7 @@ void TransparentProxy::tear_down() {
 }
 
 void TransparentProxy::hangup() {
-  on_error(Status::Error("Cancelled"));
+  on_error(Status::Error("Canceled"));
 }
 
 void TransparentProxy::start_up() {
@@ -67,13 +67,13 @@ void TransparentProxy::loop() {
     TRY_STATUS(fd_.flush_read());
     TRY_STATUS(loop_impl());
     TRY_STATUS(fd_.flush_write());
+    if (can_close_local(fd_)) {
+      return Status::Error("Connection closed");
+    }
     return Status::OK();
   }();
   if (status.is_error()) {
     on_error(std::move(status));
-  }
-  if (can_close_local(fd_)) {
-    on_error(Status::Error("Connection closed"));
   }
 }
 

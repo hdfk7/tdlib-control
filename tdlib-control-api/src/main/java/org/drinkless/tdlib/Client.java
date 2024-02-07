@@ -1,208 +1,186 @@
-//
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
-//
-// Distributed under the Boost Software License, Version 1.0. (See accompanying
-// file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
-//
 package org.drinkless.tdlib;
 
-import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
-/**
- * Main class for interaction with the TDLib.
- */
 public final class Client {
-    /**
-     * Interface for handler for results of queries to TDLib and incoming updates from TDLib.
-     */
-    public interface ResultHandler {
-        /**
-         * Callback called on result of query to TDLib or incoming update from TDLib.
-         *
-         * @param object Result of query or update of type TdApi.Update about new events.
-         */
-        void onResult(TdApi.Object object);
-    }
+    private final int nativeClientId;
+    private static final ConcurrentHashMap<Integer, ExceptionHandler> defaultExceptionHandlers;
+    private static final ConcurrentHashMap<Integer, Handler> updateHandlers;
+    private static final ConcurrentHashMap<Long, Handler> handlers;
+    private static final AtomicLong currentQueryId;
+    private static final AtomicLong clientCount;
+    private static final ResponseReceiver responseReceiver;
 
-    /**
-     * Interface for handler of exceptions thrown while invoking ResultHandler.
-     * By default, all such exceptions are ignored.
-     * All exceptions thrown from ExceptionHandler are ignored.
-     */
-    public interface ExceptionHandler {
-        /**
-         * Callback called on exceptions thrown while invoking ResultHandler.
-         *
-         * @param e Exception thrown by ResultHandler.
-         */
-        void onException(Throwable e);
-    }
-
-    /**
-     * Sends a request to the TDLib.
-     *
-     * @param query            Object representing a query to the TDLib.
-     * @param resultHandler    Result handler with onResult method which will be called with result
-     *                         of the query or with TdApi.Error as parameter. If it is null, nothing
-     *                         will be called.
-     * @param exceptionHandler Exception handler with onException method which will be called on
-     *                         exception thrown from resultHandler. If it is null, then
-     *                         defaultExceptionHandler will be called.
-     * @throws NullPointerException if query is null.
-     */
-    public void send(TdApi.Function query, ResultHandler resultHandler, ExceptionHandler exceptionHandler) {
-        long queryId = currentQueryId.incrementAndGet();
-        if (resultHandler != null) {
-            handlers.put(queryId, new Handler(resultHandler, exceptionHandler));
+    public void send(TdApi.Function var1, ResultHandler var2, ExceptionHandler var3) {
+        long var4 = currentQueryId.incrementAndGet();
+        if (var2 != null) {
+            handlers.put(var4, new Handler(var2, var3));
         }
-        nativeClientSend(nativeClientId, queryId, query);
+
+        nativeClientSend(this.nativeClientId, var4, var1);
     }
 
-    /**
-     * Sends a request to the TDLib with an empty ExceptionHandler.
-     *
-     * @param query         Object representing a query to the TDLib.
-     * @param resultHandler Result handler with onResult method which will be called with result
-     *                      of the query or with TdApi.Error as parameter. If it is null, then
-     *                      defaultExceptionHandler will be called.
-     * @throws NullPointerException if query is null.
-     */
-    public void send(TdApi.Function query, ResultHandler resultHandler) {
-        send(query, resultHandler, null);
+    public void send(TdApi.Function var1, ResultHandler var2) {
+        this.send(var1, var2, (ExceptionHandler) null);
     }
 
-    /**
-     * Synchronously executes a TDLib request. Only a few marked accordingly requests can be executed synchronously.
-     *
-     * @param query Object representing a query to the TDLib.
-     * @return request result.
-     * @throws NullPointerException if query is null.
-     */
-    public static TdApi.Object execute(TdApi.Function query) {
-        return nativeClientExecute(query);
+    public static <T extends TdApi.Object> T execute(TdApi.Function<T> var0) throws ExecutionException {
+        TdApi.Object var1 = nativeClientExecute(var0);
+        if (var1 instanceof TdApi.Error) {
+            throw new ExecutionException((TdApi.Error) var1);
+        } else {
+            return (T) var1;
+        }
     }
 
-    /**
-     * Creates new Client.
-     *
-     * @param updateHandler           Handler for incoming updates.
-     * @param updateExceptionHandler  Handler for exceptions thrown from updateHandler. If it is null, exceptions will be iggnored.
-     * @param defaultExceptionHandler Default handler for exceptions thrown from all ResultHandler. If it is null, exceptions will be iggnored.
-     * @return created Client
-     */
-    public static Client create(ResultHandler updateHandler, ExceptionHandler updateExceptionHandler, ExceptionHandler defaultExceptionHandler, TdApi.AddProxy proxy) {
-        Client client = new Client(updateHandler, updateExceptionHandler, defaultExceptionHandler);
+    public static Client create(ResultHandler var0, ExceptionHandler var1, ExceptionHandler var2, TdApi.AddProxy proxy) {
+        Client var3 = new Client(var0, var1, var2);
         if (proxy != null) {
-            client.send(proxy, null);
+            var3.send(proxy, null);
         }
         synchronized (responseReceiver) {
             if (!responseReceiver.isRun) {
                 responseReceiver.isRun = true;
-                Thread receiverThread = new Thread(responseReceiver, "TDLib thread");
-                receiverThread.setDaemon(true);
-                receiverThread.start();
+                Thread var5 = new Thread(responseReceiver, "TDLib thread");
+                var5.setDaemon(true);
+                var5.start();
             }
+
+            return var3;
         }
-        return client;
     }
 
-    private static class ResponseReceiver implements Runnable {
-        public boolean isRun = false;
-
-        @Override
-        public void run() {
-            while (true) {
-                int resultN = nativeClientReceive(clientIds, eventIds, events, 100000.0 /*seconds*/);
-                for (int i = 0; i < resultN; i++) {
-                    processResult(clientIds[i], eventIds[i], events[i]);
-                    events[i] = null;
-                }
-            }
-        }
-
-        private void processResult(int clientId, long id, TdApi.Object object) {
-            boolean isClosed = false;
-            if (id == 0 && object instanceof TdApi.UpdateAuthorizationState) {
-                TdApi.AuthorizationState authorizationState = ((TdApi.UpdateAuthorizationState) object).authorizationState;
-                if (authorizationState instanceof TdApi.AuthorizationStateClosed) {
-                    isClosed = true;
-                }
-            }
-
-            Handler handler = id == 0 ? updateHandlers.get(clientId) : handlers.remove(id);
-            if (handler != null) {
-                try {
-                    handler.resultHandler.onResult(object);
-                } catch (Throwable cause) {
-                    ExceptionHandler exceptionHandler = handler.exceptionHandler;
-                    if (exceptionHandler == null) {
-                        exceptionHandler = defaultExceptionHandlers.get(clientId);
-                    }
-                    if (exceptionHandler != null) {
-                        try {
-                            exceptionHandler.onException(cause);
-                        } catch (Throwable ignored) {
-                        }
-                    }
-                }
-            }
-
-            if (isClosed) {
-                updateHandlers.remove(clientId);           // there will be no more updates
-                defaultExceptionHandlers.remove(clientId); // ignore further exceptions
-                clientCount.decrementAndGet();
-            }
-        }
-
-        private static final int MAX_EVENTS = 1000;
-        private final int[] clientIds = new int[MAX_EVENTS];
-        private final long[] eventIds = new long[MAX_EVENTS];
-        private final TdApi.Object[] events = new TdApi.Object[MAX_EVENTS];
+    public static void setLogMessageHandler(int var0, LogMessageHandler var1) {
+        nativeClientSetLogMessageHandler(var0, var1);
     }
 
-    private final int nativeClientId;
+    private Client(ResultHandler var1, ExceptionHandler var2, ExceptionHandler var3) {
+        clientCount.incrementAndGet();
+        this.nativeClientId = createNativeClient();
+        if (var1 != null) {
+            updateHandlers.put(this.nativeClientId, new Handler(var1, var2));
+        }
 
-    private static final ConcurrentHashMap<Integer, ExceptionHandler> defaultExceptionHandlers = new ConcurrentHashMap<Integer, ExceptionHandler>();
-    private static final ConcurrentHashMap<Integer, Handler> updateHandlers = new ConcurrentHashMap<Integer, Handler>();
-    private static final ConcurrentHashMap<Long, Handler> handlers = new ConcurrentHashMap<Long, Handler>();
-    private static final AtomicLong currentQueryId = new AtomicLong();
-    private static final AtomicLong clientCount = new AtomicLong();
+        if (var3 != null) {
+            defaultExceptionHandlers.put(this.nativeClientId, var3);
+        }
 
-    private static final ResponseReceiver responseReceiver = new ResponseReceiver();
+        this.send(new TdApi.GetOption("version"), (ResultHandler) null, (ExceptionHandler) null);
+    }
+
+    private static native int createNativeClient();
+
+    private static native void nativeClientSend(int var0, long var1, TdApi.Function var3);
+
+    private static native int nativeClientReceive(int[] var0, long[] var1, TdApi.Object[] var2, double var3);
+
+    private static native TdApi.Object nativeClientExecute(TdApi.Function var0);
+
+    private static native void nativeClientSetLogMessageHandler(int var0, LogMessageHandler var1);
+
+    static {
+        try {
+            System.loadLibrary("tdjni");
+        } catch (UnsatisfiedLinkError var1) {
+            var1.printStackTrace();
+        }
+
+        defaultExceptionHandlers = new ConcurrentHashMap();
+        updateHandlers = new ConcurrentHashMap();
+        handlers = new ConcurrentHashMap();
+        currentQueryId = new AtomicLong();
+        clientCount = new AtomicLong();
+        responseReceiver = new ResponseReceiver();
+    }
 
     private static class Handler {
         final ResultHandler resultHandler;
         final ExceptionHandler exceptionHandler;
 
-        Handler(ResultHandler resultHandler, ExceptionHandler exceptionHandler) {
-            this.resultHandler = resultHandler;
-            this.exceptionHandler = exceptionHandler;
+        Handler(ResultHandler var1, ExceptionHandler var2) {
+            this.resultHandler = var1;
+            this.exceptionHandler = var2;
         }
     }
 
-    private Client(ResultHandler updateHandler, ExceptionHandler updateExceptionHandler, ExceptionHandler defaultExceptionHandler) {
-        clientCount.incrementAndGet();
-        nativeClientId = createNativeClient();
-        if (updateHandler != null) {
-            updateHandlers.put(nativeClientId, new Handler(updateHandler, updateExceptionHandler));
-        }
-        if (defaultExceptionHandler != null) {
-            defaultExceptionHandlers.put(nativeClientId, defaultExceptionHandler);
+    public interface ResultHandler {
+        void onResult(TdApi.Object var1);
+    }
+
+    public interface ExceptionHandler {
+        void onException(Throwable var1);
+    }
+
+    public static class ExecutionException extends Exception {
+        public final TdApi.Error error;
+
+        ExecutionException(TdApi.Error var1) {
+            super(var1.code + ": " + var1.message);
+            this.error = var1;
         }
     }
 
-    @Override
-    protected void finalize() throws Throwable {
-        send(new TdApi.Close(), null, null);
+    private static class ResponseReceiver implements Runnable {
+        public boolean isRun = false;
+        private static final int MAX_EVENTS = 1000;
+        private final int[] clientIds = new int[1000];
+        private final long[] eventIds = new long[1000];
+        private final TdApi.Object[] events = new TdApi.Object[1000];
+
+        private ResponseReceiver() {
+        }
+
+        public void run() {
+            while (true) {
+                int var1 = Client.nativeClientReceive(this.clientIds, this.eventIds, this.events, 100000.0);
+
+                for (int var2 = 0; var2 < var1; ++var2) {
+                    this.processResult(this.clientIds[var2], this.eventIds[var2], this.events[var2]);
+                    this.events[var2] = null;
+                }
+            }
+        }
+
+        private void processResult(int var1, long var2, TdApi.Object var4) {
+            boolean var5 = false;
+            if (var2 == 0L && var4 instanceof TdApi.UpdateAuthorizationState) {
+                TdApi.AuthorizationState var6 = ((TdApi.UpdateAuthorizationState) var4).authorizationState;
+                if (var6 instanceof TdApi.AuthorizationStateClosed) {
+                    var5 = true;
+                }
+            }
+
+            Handler var12 = var2 == 0L ? (Handler) Client.updateHandlers.get(var1) : (Handler) Client.handlers.remove(var2);
+            if (var12 != null) {
+                try {
+                    var12.resultHandler.onResult(var4);
+                } catch (Throwable var11) {
+                    Throwable var7 = var11;
+                    ExceptionHandler var8 = var12.exceptionHandler;
+                    if (var8 == null) {
+                        var8 = Client.defaultExceptionHandlers.get(var1);
+                    }
+
+                    if (var8 != null) {
+                        try {
+                            var8.onException(var7);
+                        } catch (Throwable var10) {
+                        }
+                    }
+                }
+            }
+
+            if (var5) {
+                Client.updateHandlers.remove(var1);
+                Client.defaultExceptionHandlers.remove(var1);
+                Client.clientCount.decrementAndGet();
+            }
+
+        }
     }
 
-    private static native int createNativeClient();
-
-    private static native void nativeClientSend(int nativeClientId, long eventId, TdApi.Function function);
-
-    private static native int nativeClientReceive(int[] clientIds, long[] eventIds, TdApi.Object[] events, double timeout);
-
-    private static native TdApi.Object nativeClientExecute(TdApi.Function function);
+    public interface LogMessageHandler {
+        void onLogMessage(int var1, String var2);
+    }
 }

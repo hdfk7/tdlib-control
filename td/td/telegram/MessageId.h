@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -8,11 +8,12 @@
 
 #include "td/telegram/ScheduledServerMessageId.h"
 #include "td/telegram/ServerMessageId.h"
+#include "td/telegram/telegram_api.h"
 
 #include "td/utils/common.h"
+#include "td/utils/HashTableUtils.h"
 #include "td/utils/StringBuilder.h"
 
-#include <functional>
 #include <limits>
 #include <type_traits>
 
@@ -40,6 +41,10 @@ class MessageId {
   // scheduled message ID layout
   // |-------30-------|----18---|1|--2-|
   // |send_date-2**30 |server_id|1|type|
+
+  // sponsored message ID layout
+  // |-------31--------|---17---|1|-2|
+  // |11111111111111111|local_id|0|10|
 
   ServerMessageId get_server_message_id_force() const;
 
@@ -69,9 +74,23 @@ class MessageId {
     return MessageId(static_cast<int64>(std::numeric_limits<int32>::max()) << SERVER_ID_SHIFT);
   }
 
+  static MessageId get_message_id(const telegram_api::Message *message_ptr, bool is_scheduled);
+
+  static MessageId get_message_id(const tl_object_ptr<telegram_api::Message> &message_ptr, bool is_scheduled);
+
+  static MessageId get_max_message_id(const vector<telegram_api::object_ptr<telegram_api::Message>> &messages);
+
+  static vector<MessageId> get_message_ids(const vector<int64> &input_message_ids);
+
+  static vector<int32> get_server_message_ids(const vector<MessageId> &message_ids);
+
+  static vector<int32> get_scheduled_server_message_ids(const vector<MessageId> &message_ids);
+
   bool is_valid() const;
 
   bool is_valid_scheduled() const;
+
+  bool is_valid_sponsored() const;
 
   int64 get() const {
     return id;
@@ -176,8 +195,8 @@ class MessageId {
 };
 
 struct MessageIdHash {
-  std::size_t operator()(MessageId message_id) const {
-    return std::hash<int64>()(message_id.get());
+  uint32 operator()(MessageId message_id) const {
+    return Hash<int64>()(message_id.get());
   }
 };
 

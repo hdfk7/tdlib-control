@@ -1,21 +1,18 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/Global.h"
 
-#include "td/telegram/ConfigShared.h"
+#include "td/telegram/AuthManager.h"
 #include "td/telegram/net/ConnectionCreator.h"
-#include "td/telegram/net/MtprotoHeader.h"
 #include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/net/TempAuthKeyWatchdog.h"
+#include "td/telegram/OptionManager.h"
 #include "td/telegram/StateManager.h"
-#include "td/telegram/Td.h"
 #include "td/telegram/TdDb.h"
-
-#include "td/actor/PromiseFuture.h"
 
 #include "td/utils/format.h"
 #include "td/utils/logging.h"
@@ -27,19 +24,24 @@
 
 namespace td {
 
-Global::Global() = default;
+Global::Global() {
+  auto current_scheduler_id = Scheduler::instance()->sched_id();
+  auto max_scheduler_id = Scheduler::instance()->sched_count() - 1;
+  database_scheduler_id_ = min(current_scheduler_id + 1, max_scheduler_id);
+  gc_scheduler_id_ = min(current_scheduler_id + 2, max_scheduler_id);
+  slow_net_scheduler_id_ = min(current_scheduler_id + 3, max_scheduler_id);
+}
 
 Global::~Global() = default;
 
-void Global::close_all(Promise<> on_finished) {
-  td_db_->close_all(std::move(on_finished));
-  state_manager_.clear();
-  parameters_ = TdParameters();
+void Global::log_out(Slice reason) {
+  send_closure(auth_manager_, &AuthManager::on_authorization_lost, reason.str());
 }
-void Global::close_and_destroy_all(Promise<> on_finished) {
-  td_db_->close_and_destroy_all(std::move(on_finished));
+
+void Global::close_all(bool destroy_flag, Promise<Unit> on_finished) {
+  td_db_->close(use_sqlite_pmc() ? get_database_scheduler_id() : get_slow_net_scheduler_id(), destroy_flag,
+                std::move(on_finished));
   state_manager_.clear();
-  parameters_ = TdParameters();
 }
 
 ActorId<ConnectionCreator> Global::connection_creator() const {
@@ -85,12 +87,7 @@ struct ServerTimeDiff {
   }
 };
 
-Status Global::init(const TdParameters &parameters, ActorId<Td> td, unique_ptr<TdDb> td_db_ptr) {
-  parameters_ = parameters;
-
-  gc_scheduler_id_ = min(Scheduler::instance()->sched_id() + 2, Scheduler::instance()->sched_count() - 1);
-  slow_net_scheduler_id_ = min(Scheduler::instance()->sched_id() + 3, Scheduler::instance()->sched_count() - 1);
-
+Status Global::init(ActorId<Td> td, unique_ptr<TdDb> td_db_ptr) {
   td_ = td;
   td_db_ = std::move(td_db_ptr);
 
@@ -135,21 +132,65 @@ Status Global::init(const TdParameters &parameters, ActorId<Td> td, unique_ptr<T
   return Status::OK();
 }
 
+Slice Global::get_dir() const {
+  return td_db_->get_database_directory();
+}
+
+Slice Global::get_files_dir() const {
+  return td_db_->get_files_directory();
+}
+
+bool Global::is_test_dc() const {
+  return td_db_->is_test_dc();
+}
+
+bool Global::use_file_database() const {
+  return td_db_->use_file_database();
+}
+
+bool Global::use_sqlite_pmc() const {
+  return td_db_->use_sqlite_pmc();
+}
+
+bool Global::use_chat_info_database() const {
+  return td_db_->use_chat_info_database();
+}
+
+bool Global::use_message_database() const {
+  return td_db_->use_message_database();
+}
+
+int32 Global::get_retry_after(int32 error_code, Slice error_message) {
+  if (error_code != 429) {
+    return 0;
+  }
+
+  Slice retry_after_prefix("Too Many Requests: retry after ");
+  if (!begins_with(error_message, retry_after_prefix)) {
+    return 0;
+  }
+
+  auto r_retry_after = to_integer_safe<int32>(error_message.substr(retry_after_prefix.size()));
+  if (r_retry_after.is_ok() && r_retry_after.ok() > 0) {
+    return r_retry_after.ok();
+  }
+  return 0;
+}
+
 int32 Global::to_unix_time(double server_time) const {
   LOG_CHECK(1.0 <= server_time && server_time <= 2140000000.0)
-      << server_time << " " << Clocks::system() << " " << is_server_time_reliable() << " "
-      << get_server_time_difference() << " " << Time::now() << saved_diff_ << " " << saved_system_time_;
+      << server_time << ' ' << Clocks::system() << ' ' << is_server_time_reliable() << ' '
+      << get_server_time_difference() << ' ' << Time::now() << ' ' << saved_diff_ << ' ' << saved_system_time_;
   return static_cast<int32>(server_time);
 }
 
-void Global::update_server_time_difference(double diff) {
-  if (!server_time_difference_was_updated_ || server_time_difference_ < diff) {
+void Global::update_server_time_difference(double diff, bool force) {
+  if (force || !server_time_difference_was_updated_ || server_time_difference_ < diff) {
     server_time_difference_ = diff;
     server_time_difference_was_updated_ = true;
     do_save_server_time_difference();
 
-    CHECK(Scheduler::instance());
-    send_closure(td(), &Td::on_update_server_time_difference);
+    get_option_manager()->on_update_server_time_difference();
   }
 }
 
@@ -162,7 +203,8 @@ void Global::save_server_time() {
 }
 
 void Global::do_save_server_time_difference() {
-  if (shared_config_ != nullptr && shared_config_->get_option_boolean("disable_time_adjustment_protection")) {
+  if (get_option_boolean("disable_time_adjustment_protection")) {
+    td_db()->get_binlog_pmc()->erase("server_time_difference");
     return;
   }
 
@@ -200,8 +242,7 @@ double Global::get_dns_time_difference() const {
 }
 
 DcId Global::get_webfile_dc_id() const {
-  CHECK(shared_config_ != nullptr);
-  auto dc_id = narrow_cast<int32>(shared_config_->get_option_integer("webfile_dc_id"));
+  auto dc_id = narrow_cast<int32>(get_option_integer("webfile_dc_id"));
   if (!DcId::is_valid(dc_id)) {
     if (is_test_dc()) {
       dc_id = 2;
@@ -215,11 +256,6 @@ DcId Global::get_webfile_dc_id() const {
   return DcId::internal(dc_id);
 }
 
-bool Global::ignore_backgrond_updates() const {
-  return !parameters_.use_file_db && !parameters_.use_secret_chats &&
-         shared_config_->get_option_boolean("ignore_background_updates");
-}
-
 void Global::set_net_query_stats(std::shared_ptr<NetQueryStats> net_query_stats) {
   net_query_creator_.set_create_func(
       [net_query_stats = std::move(net_query_stats)] { return td::make_unique<NetQueryCreator>(net_query_stats); });
@@ -229,8 +265,46 @@ void Global::set_net_query_dispatcher(unique_ptr<NetQueryDispatcher> net_query_d
   net_query_dispatcher_ = std::move(net_query_dispatcher);
 }
 
-void Global::set_shared_config(unique_ptr<ConfigShared> shared_config) {
-  shared_config_ = std::move(shared_config);
+const OptionManager *Global::get_option_manager() const {
+  CHECK(option_manager_ != nullptr);
+  return option_manager_;
+}
+
+OptionManager *Global::get_option_manager() {
+  CHECK(option_manager_ != nullptr);
+  return option_manager_;
+}
+
+void Global::set_option_empty(Slice name) {
+  get_option_manager()->set_option_empty(name);
+}
+
+void Global::set_option_boolean(Slice name, bool value) {
+  get_option_manager()->set_option_boolean(name, value);
+}
+
+void Global::set_option_integer(Slice name, int64 value) {
+  get_option_manager()->set_option_integer(name, value);
+}
+
+void Global::set_option_string(Slice name, Slice value) {
+  get_option_manager()->set_option_string(name, value);
+}
+
+bool Global::have_option(Slice name) const {
+  return get_option_manager()->have_option(name);
+}
+
+bool Global::get_option_boolean(Slice name, bool default_value) const {
+  return get_option_manager()->get_option_boolean(name, default_value);
+}
+
+int64 Global::get_option_integer(Slice name, int64 default_value) const {
+  return get_option_manager()->get_option_integer(name, default_value);
+}
+
+string Global::get_option_string(Slice name, string default_value) const {
+  return get_option_manager()->get_option_string(name, std::move(default_value));
 }
 
 int64 Global::get_location_key(double latitude, double longitude) {
@@ -247,6 +321,9 @@ int64 Global::get_location_key(double latitude, double longitude) {
   double f = std::tan(PI / 4 - latitude / 2);
   key += static_cast<int64>(f * std::cos(longitude) * 128) * 256;
   key += static_cast<int64>(f * std::sin(longitude) * 128);
+  if (key == 0) {
+    key = 1;
+  }
   return key;
 }
 

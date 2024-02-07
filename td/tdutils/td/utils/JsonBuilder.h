@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -14,6 +14,7 @@
 #include "td/utils/Status.h"
 #include "td/utils/StringBuilder.h"
 
+#include <functional>
 #include <new>
 #include <type_traits>
 #include <utility>
@@ -95,7 +96,7 @@ class JsonFloat {
 
 class JsonOneChar {
  public:
-  explicit JsonOneChar(unsigned int c) : c_(c) {
+  explicit JsonOneChar(uint32 c) : c_(c) {
   }
 
   friend StringBuilder &operator<<(StringBuilder &sb, const JsonOneChar &val) {
@@ -105,12 +106,12 @@ class JsonOneChar {
   }
 
  private:
-  unsigned int c_;
+  uint32 c_;
 };
 
 class JsonChar {
  public:
-  explicit JsonChar(unsigned int c) : c_(c) {
+  explicit JsonChar(uint32 c) : c_(c) {
   }
   friend StringBuilder &operator<<(StringBuilder &sb, const JsonChar &val) {
     auto c = val.c_;
@@ -129,7 +130,7 @@ class JsonChar {
   }
 
  private:
-  unsigned int c_;
+  uint32 c_;
 };
 
 class JsonRaw {
@@ -222,11 +223,11 @@ class JsonScope {
     jb_->scope_ = this;
     CHECK(is_active());
   }
-  JsonScope(const JsonScope &other) = delete;
-  JsonScope(JsonScope &&other) : sb_(other.sb_), jb_(other.jb_), save_scope_(other.save_scope_) {
+  JsonScope(const JsonScope &) = delete;
+  JsonScope &operator=(const JsonScope &) = delete;
+  JsonScope(JsonScope &&other) noexcept : sb_(other.sb_), jb_(other.jb_), save_scope_(other.save_scope_) {
     other.jb_ = nullptr;
   }
-  JsonScope &operator=(const JsonScope &) = delete;
   JsonScope &operator=(JsonScope &&) = delete;
   ~JsonScope() {
     if (jb_) {
@@ -311,7 +312,7 @@ class JsonScope {
   }
 };
 
-class JsonValueScope : public JsonScope {
+class JsonValueScope final : public JsonScope {
  public:
   using JsonScope::JsonScope;
   template <class T>
@@ -336,13 +337,16 @@ class JsonValueScope : public JsonScope {
   bool was_ = false;
 };
 
-class JsonArrayScope : public JsonScope {
+class JsonArrayScope final : public JsonScope {
  public:
   explicit JsonArrayScope(JsonBuilder *jb) : JsonScope(jb) {
     jb->inc_offset();
     *sb_ << "[";
   }
-  JsonArrayScope(JsonArrayScope &&other) = default;
+  JsonArrayScope(const JsonArrayScope &) = delete;
+  JsonArrayScope &operator=(const JsonArrayScope &) = delete;
+  JsonArrayScope(JsonArrayScope &&) = default;
+  JsonArrayScope &operator=(JsonArrayScope &&) = delete;
   ~JsonArrayScope() {
     if (jb_) {
       leave();
@@ -377,13 +381,16 @@ class JsonArrayScope : public JsonScope {
   bool is_first_ = false;
 };
 
-class JsonObjectScope : public JsonScope {
+class JsonObjectScope final : public JsonScope {
  public:
   explicit JsonObjectScope(JsonBuilder *jb) : JsonScope(jb) {
     jb->inc_offset();
     *sb_ << "{";
   }
-  JsonObjectScope(JsonObjectScope &&other) = default;
+  JsonObjectScope(const JsonObjectScope &) = delete;
+  JsonObjectScope &operator=(const JsonObjectScope &) = delete;
+  JsonObjectScope(JsonObjectScope &&) = default;
+  JsonObjectScope &operator=(JsonObjectScope &&) = delete;
   ~JsonObjectScope() {
     if (jb_) {
       leave();
@@ -395,7 +402,7 @@ class JsonObjectScope : public JsonScope {
     *sb_ << "}";
   }
   template <class T>
-  JsonObjectScope &operator()(Slice key, T &&value) {
+  JsonObjectScope &operator()(Slice field, T &&value) {
     CHECK(is_active());
     if (is_first_) {
       *sb_ << ",";
@@ -403,7 +410,7 @@ class JsonObjectScope : public JsonScope {
       is_first_ = true;
     }
     jb_->print_offset();
-    jb_->enter_value() << key;
+    jb_->enter_value() << field;
     if (jb_->is_pretty()) {
       *sb_ << " : ";
     } else {
@@ -412,10 +419,10 @@ class JsonObjectScope : public JsonScope {
     jb_->enter_value() << value;
     return *this;
   }
-  JsonObjectScope &operator<<(const JsonRaw &key_value) {
+  JsonObjectScope &operator<<(const JsonRaw &field_value) {
     CHECK(is_active());
     is_first_ = true;
-    jb_->enter_value() << key_value;
+    jb_->enter_value() << field_value;
     return *this;
   }
 
@@ -445,12 +452,65 @@ inline JsonArrayScope JsonBuilder::enter_array() {
 
 class JsonValue;
 
-using JsonObject = vector<std::pair<MutableSlice, JsonValue>>;
+enum class JsonValueType { Null, Number, Boolean, String, Array, Object };
+
 using JsonArray = vector<JsonValue>;
 
-class JsonValue : public Jsonable {
+class JsonObject {
+  const JsonValue *get_field(Slice name) const;
+
  public:
-  enum class Type { Null, Number, Boolean, String, Array, Object };
+  vector<std::pair<Slice, JsonValue>> field_values_;
+
+  JsonObject() = default;
+
+  explicit JsonObject(vector<std::pair<Slice, JsonValue>> &&field_values) : field_values_(std::move(field_values)) {
+  }
+
+  JsonObject(const JsonObject &) = delete;
+  JsonObject &operator=(const JsonObject &) = delete;
+  JsonObject(JsonObject &&) noexcept = default;
+  JsonObject &operator=(JsonObject &&) noexcept = default;
+  ~JsonObject() = default;
+
+  size_t field_count() const {
+    return field_values_.size();
+  }
+
+  JsonValue extract_field(Slice name);
+
+  Result<JsonValue> extract_optional_field(Slice name, JsonValueType type);
+
+  Result<JsonValue> extract_required_field(Slice name, JsonValueType type);
+
+  bool has_field(Slice name) const;
+
+  Result<bool> get_optional_bool_field(Slice name, bool default_value = false) const;
+
+  Result<bool> get_required_bool_field(Slice name) const;
+
+  Result<int32> get_optional_int_field(Slice name, int32 default_value = 0) const;
+
+  Result<int32> get_required_int_field(Slice name) const;
+
+  Result<int64> get_optional_long_field(Slice name, int64 default_value = 0) const;
+
+  Result<int64> get_required_long_field(Slice name) const;
+
+  Result<double> get_optional_double_field(Slice name, double default_value = 0.0) const;
+
+  Result<double> get_required_double_field(Slice name) const;
+
+  Result<string> get_optional_string_field(Slice name, string default_value = string()) const;
+
+  Result<string> get_required_string_field(Slice name) const;
+
+  void foreach(const std::function<void(Slice name, const JsonValue &value)> &callback) const;
+};
+
+class JsonValue final : private Jsonable {
+ public:
+  using Type = JsonValueType;
 
   static Slice get_type_name(Type type);
 
@@ -459,10 +519,10 @@ class JsonValue : public Jsonable {
   ~JsonValue() {
     destroy();
   }
-  JsonValue(JsonValue &&other) : JsonValue() {
+  JsonValue(JsonValue &&other) noexcept : JsonValue() {
     init(std::move(other));
   }
-  JsonValue &operator=(JsonValue &&other) {
+  JsonValue &operator=(JsonValue &&other) noexcept {
     if (&other == this) {
       return *this;
     }
@@ -470,8 +530,8 @@ class JsonValue : public Jsonable {
     init(std::move(other));
     return *this;
   }
-  JsonValue(const JsonValue &other) = delete;
-  JsonValue &operator=(const JsonValue &other) = delete;
+  JsonValue(const JsonValue &) = delete;
+  JsonValue &operator=(const JsonValue &) = delete;
 
   Type type() const {
     return type_;
@@ -578,8 +638,8 @@ class JsonValue : public Jsonable {
       }
       case Type::Object: {
         auto object = scope->enter_object();
-        for (auto &key_value : get_object()) {
-          object(key_value.first, key_value.second);
+        for (auto &field_value : get_object().field_values_) {
+          object(field_value.first, field_value.second);
         }
         break;
       }
@@ -658,7 +718,7 @@ class JsonValue : public Jsonable {
         array_.~vector<JsonValue>();
         break;
       case Type::Object:
-        object_.~vector<std::pair<MutableSlice, JsonValue>>();
+        object_.~JsonObject();
         break;
     }
     type_ = Type::Null;
@@ -685,7 +745,7 @@ inline StringBuilder &operator<<(StringBuilder &sb, JsonValue::Type type) {
   }
 }
 
-class VirtuallyJsonable : public Jsonable {
+class VirtuallyJsonable : private Jsonable {
  public:
   virtual void store(JsonValueScope *scope) const = 0;
   VirtuallyJsonable() = default;
@@ -696,11 +756,11 @@ class VirtuallyJsonable : public Jsonable {
   virtual ~VirtuallyJsonable() = default;
 };
 
-class VirtuallyJsonableInt : public VirtuallyJsonable {
+class VirtuallyJsonableInt final : public VirtuallyJsonable {
  public:
   explicit VirtuallyJsonableInt(int32 value) : value_(value) {
   }
-  void store(JsonValueScope *scope) const override {
+  void store(JsonValueScope *scope) const final {
     *scope << JsonInt(value_);
   }
 
@@ -708,11 +768,11 @@ class VirtuallyJsonableInt : public VirtuallyJsonable {
   int32 value_;
 };
 
-class VirtuallyJsonableLong : public VirtuallyJsonable {
+class VirtuallyJsonableLong final : public VirtuallyJsonable {
  public:
   explicit VirtuallyJsonableLong(int64 value) : value_(value) {
   }
-  void store(JsonValueScope *scope) const override {
+  void store(JsonValueScope *scope) const final {
     *scope << JsonLong(value_);
   }
 
@@ -720,11 +780,11 @@ class VirtuallyJsonableLong : public VirtuallyJsonable {
   int64 value_;
 };
 
-class VirtuallyJsonableString : public VirtuallyJsonable {
+class VirtuallyJsonableString final : public VirtuallyJsonable {
  public:
   explicit VirtuallyJsonableString(Slice value) : value_(value) {
   }
-  void store(JsonValueScope *scope) const override {
+  void store(JsonValueScope *scope) const final {
     *scope << JsonString(value_);
   }
 
@@ -766,7 +826,7 @@ StrT json_encode(const ValT &val, bool pretty = false) {
 }
 
 template <class T>
-class ToJsonImpl : public Jsonable {
+class ToJsonImpl final : private Jsonable {
  public:
   explicit ToJsonImpl(const T &value) : value_(value) {
   }
@@ -789,7 +849,7 @@ void to_json(JsonValueScope &jv, const T &value) {
 }
 
 template <class F>
-class JsonObjectImpl : Jsonable {
+class JsonObjectImpl : private Jsonable {
  public:
   explicit JsonObjectImpl(F &&f) : f_(std::forward<F>(f)) {
   }
@@ -808,7 +868,7 @@ auto json_object(F &&f) {
 }
 
 template <class F>
-class JsonArrayImpl : Jsonable {
+class JsonArrayImpl : private Jsonable {
  public:
   explicit JsonArrayImpl(F &&f) : f_(std::forward<F>(f)) {
   }
@@ -834,27 +894,5 @@ auto json_array(const A &a, F &&f) {
     }
   });
 }
-
-bool has_json_object_field(const JsonObject &object, Slice name);
-
-JsonValue get_json_object_field_force(JsonObject &object, Slice name) TD_WARN_UNUSED_RESULT;
-
-Result<JsonValue> get_json_object_field(JsonObject &object, Slice name, JsonValue::Type type,
-                                        bool is_optional = true) TD_WARN_UNUSED_RESULT;
-
-Result<bool> get_json_object_bool_field(JsonObject &object, Slice name, bool is_optional = true,
-                                        bool default_value = false) TD_WARN_UNUSED_RESULT;
-
-Result<int32> get_json_object_int_field(JsonObject &object, Slice name, bool is_optional = true,
-                                        int32 default_value = 0) TD_WARN_UNUSED_RESULT;
-
-Result<int64> get_json_object_long_field(JsonObject &object, Slice name, bool is_optional = true,
-                                         int64 default_value = 0) TD_WARN_UNUSED_RESULT;
-
-Result<double> get_json_object_double_field(JsonObject &object, Slice name, bool is_optional = true,
-                                            double default_value = 0.0) TD_WARN_UNUSED_RESULT;
-
-Result<string> get_json_object_string_field(JsonObject &object, Slice name, bool is_optional = true,
-                                            string default_value = "") TD_WARN_UNUSED_RESULT;
 
 }  // namespace td
