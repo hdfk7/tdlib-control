@@ -222,6 +222,7 @@ public final class Actuator {
                 haveAuthorization = false;
                 break;
             case 306402531:
+                print("登陆账号 " + this.phone);
                 client.send(new TdApi.SetAuthenticationPhoneNumber(phone, null), new AuthorizationRequestHandler());
                 break;
             case 445855311:
@@ -567,8 +568,6 @@ public final class Actuator {
             throw new IOError(new IOException("Write access to the current directory is required"));
         }
         client = Client.create(new UpdateHandler(), null, null, proxy);
-
-        print("登陆账号 " + this.phone);
 
         // main loop
         while (!needQuit) {
