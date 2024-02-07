@@ -6,22 +6,18 @@ import com.fansmore.api.common.exception.RepeatPhoneException;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class ActuatorManager {
-    private static ActuatorManager mInstance;
 
     private final ConcurrentHashMap<String, Actuator> actuatorMap = new ConcurrentHashMap<>();
 
     private ActuatorManager() {
     }
 
+    private static final class ActuatorManagerHolder {
+        static final ActuatorManager mInstance = new ActuatorManager();
+    }
+
     public static ActuatorManager getInstance() {
-        if (mInstance == null) {
-            synchronized (ActuatorManager.class) {
-                if (mInstance == null) {
-                    mInstance = new ActuatorManager();
-                }
-            }
-        }
-        return mInstance;
+        return ActuatorManagerHolder.mInstance;
     }
 
     public synchronized void pushPhone(String phone) {
