@@ -1,6 +1,7 @@
 package com.fansmore.api.execute;
 
 import com.fansmore.api.common.Constant;
+import com.fansmore.api.utils.JSONUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.drinkless.tdlib.Client;
 import org.drinkless.tdlib.TdApi;
@@ -1018,7 +1019,7 @@ public final class Actuator {
         }
 
         public void onResult(TdApi.Object var1) {
-            print(var1.toString());
+            print(JSONUtils.toJSONString(var1));
         }
     }
 }
