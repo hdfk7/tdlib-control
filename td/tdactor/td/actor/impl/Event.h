@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -8,7 +8,6 @@
 
 #include "td/utils/Closure.h"
 #include "td/utils/common.h"
-#include "td/utils/logging.h"
 #include "td/utils/StringBuilder.h"
 
 #include <type_traits>
@@ -49,7 +48,6 @@ class CustomEvent {
   virtual ~CustomEvent() = default;
 
   virtual void run(Actor *actor) = 0;
-  virtual CustomEvent *clone() const = 0;
   virtual void start_migrate(int32 sched_id) {
   }
   virtual void finish_migrate() {
@@ -57,26 +55,23 @@ class CustomEvent {
 };
 
 template <class ClosureT>
-class ClosureEvent : public CustomEvent {
+class ClosureEvent final : public CustomEvent {
  public:
-  void run(Actor *actor) override {
+  void run(Actor *actor) final {
     closure_.run(static_cast<typename ClosureT::ActorType *>(actor));
   }
-  CustomEvent *clone() const override {
-    return new ClosureEvent<ClosureT>(closure_.clone());
-  }
   template <class... ArgsT>
-  explicit ClosureEvent(ArgsT &&... args) : closure_(std::forward<ArgsT>(args)...) {
+  explicit ClosureEvent(ArgsT &&...args) : closure_(std::forward<ArgsT>(args)...) {
   }
 
-  void start_migrate(int32 sched_id) override {
+  void start_migrate(int32 sched_id) final {
     closure_.for_each([sched_id](auto &obj) {
       using ::td::start_migrate;
       start_migrate(obj, sched_id);
     });
   }
 
-  void finish_migrate() override {
+  void finish_migrate() final {
     closure_.for_each([](auto &obj) {
       using ::td::finish_migrate;
       finish_migrate(obj);
@@ -88,17 +83,13 @@ class ClosureEvent : public CustomEvent {
 };
 
 template <class LambdaT>
-class LambdaEvent : public CustomEvent {
+class LambdaEvent final : public CustomEvent {
  public:
-  void run(Actor *actor) override {
+  void run(Actor *actor) final {
     f_();
   }
-  CustomEvent *clone() const override {
-    LOG(FATAL) << "Not supported";
-    return nullptr;
-  }
-  template <class FromLambdaT>
-  explicit LambdaEvent(FromLambdaT &&lambda) : f_(std::forward<FromLambdaT>(lambda)) {
+  template <class FromLambdaT, std::enable_if_t<!std::is_same<std::decay_t<FromLambdaT>, LambdaEvent>::value, int> = 0>
+  explicit LambdaEvent(FromLambdaT &&func) : f_(std::forward<FromLambdaT>(func)) {
   }
 
  private:
@@ -152,24 +143,24 @@ class Event {
         new ClosureEvent<typename FromImmediateClosureT::Delayed>(std::forward<FromImmediateClosureT>(closure)));
   }
   template <class... ArgsT>
-  static Event delayed_closure(ArgsT &&... args) {
+  static Event delayed_closure(ArgsT &&...args) {
     using DelayedClosureT = decltype(create_delayed_closure(std::forward<ArgsT>(args)...));
     return custom(new ClosureEvent<DelayedClosureT>(std::forward<ArgsT>(args)...));
   }
 
   template <class FromLambdaT>
-  static Event lambda(FromLambdaT &&lambda) {
-    return custom(new LambdaEvent<std::decay_t<FromLambdaT>>(std::forward<FromLambdaT>(lambda)));
+  static Event from_lambda(FromLambdaT &&func) {
+    return custom(new LambdaEvent<std::decay_t<FromLambdaT>>(std::forward<FromLambdaT>(func)));
   }
 
   Event() : Event(Type::NoType) {
   }
-  Event(const Event &other) = delete;
+  Event(const Event &) = delete;
   Event &operator=(const Event &) = delete;
-  Event(Event &&other) : type(other.type), link_token(other.link_token), data(other.data) {
+  Event(Event &&other) noexcept : type(other.type), link_token(other.link_token), data(other.data) {
     other.type = Type::NoType;
   }
-  Event &operator=(Event &&other) {
+  Event &operator=(Event &&other) noexcept {
     destroy();
     type = other.type;
     link_token = other.link_token;
@@ -179,17 +170,6 @@ class Event {
   }
   ~Event() {
     destroy();
-  }
-
-  Event clone() const {
-    Event res;
-    res.type = type;
-    if (type == Type::Custom) {
-      res.data.custom_event = data.custom_event->clone();
-    } else {
-      res.data = data;
-    }
-    return res;
   }
 
   bool empty() const {

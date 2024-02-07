@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -12,7 +12,7 @@
 
 #if !TD_EVENTFD_UNSUPPORTED
 
-#include "td/utils/SpinLock.h"
+#include "td/utils/port/Mutex.h"
 
 #include <utility>
 
@@ -33,6 +33,8 @@ class MpscPollableQueue {
       auto guard = lock_.lock();
       if (writer_vector_.empty()) {
         if (i == 1) {
+          reader_vector_.clear();
+          reader_pos_ = 0;
           wait_event_fd_ = true;
           return 0;
         }
@@ -68,6 +70,11 @@ class MpscPollableQueue {
     //nop
   }
 
+  bool is_empty() {
+    auto guard = lock_.lock();
+    return writer_vector_.empty() && reader_vector_.empty();
+  }
+
   void init() {
     event_fd_.init();
   }
@@ -91,7 +98,7 @@ class MpscPollableQueue {
   }
 
  private:
-  SpinLock lock_;
+  Mutex lock_;
   bool wait_event_fd_{false};
   EventFd event_fd_;
   std::vector<ValueType> writer_vector_;

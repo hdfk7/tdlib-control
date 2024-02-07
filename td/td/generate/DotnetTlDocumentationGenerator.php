@@ -11,7 +11,7 @@ class DotnetTlDocumentationGenerator extends TlDocumentationGenerator
             {
                 return ucfirst(preg_replace_callback('/_([A-Za-z])/', function ($matches) {return strtoupper($matches[1]);}, $word_matches[0]));
             }, $doc);
-        $doc = htmlspecialchars($doc, ENT_XML1);
+        $doc = htmlspecialchars($doc, ENT_XML1, 'UTF-8');
         $doc = str_replace('*/', '*&#47;', $doc);
         return $doc;
     }
@@ -164,7 +164,7 @@ EOT
         return "\r\n$shift/// <para>Returns <see cref=\"".substr($return_type, 0, -1).'"/>.</para>';
     }
 
-    protected function addClassDocumentation($class_name, $base_class_name, $description)
+    protected function addClassDocumentation($class_name, $base_class_name, $return_type, $description)
     {
         $this->addDocumentation("public ref class $class_name sealed : $base_class_name {", <<<EOT
 /// <summary>

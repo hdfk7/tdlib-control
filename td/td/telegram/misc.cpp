@@ -1,14 +1,15 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/misc.h"
 
+#include "td/utils/algorithm.h"
 #include "td/utils/common.h"
-#include "td/utils/HttpUrl.h"
-#include "td/utils/logging.h"
+#include "td/utils/crypto.h"
+#include "td/utils/Hints.h"
 #include "td/utils/misc.h"
 #include "td/utils/Slice.h"
 #include "td/utils/utf8.h"
@@ -52,6 +53,10 @@ string clean_username(string str) {
   return trim(str);
 }
 
+void clean_phone_number(string &phone_number) {
+  td::remove_if(phone_number, [](char c) { return !is_digit(c); });
+}
+
 void replace_offending_characters(string &str) {
   // "(\xe2\x80\x8f|\xe2\x80\x8e){N}(\xe2\x80\x8f|\xe2\x80\x8e)" -> "(\xe2\x80\x8c){N}$2"
   auto s = MutableSlice(str).ubegin();
@@ -75,7 +80,7 @@ bool clean_input_string(string &str) {
   size_t str_size = str.size();
   size_t new_size = 0;
   for (size_t pos = 0; pos < str_size; pos++) {
-    unsigned char c = static_cast<unsigned char>(str[pos]);
+    auto c = static_cast<unsigned char>(str[pos]);
     switch (c) {
       // remove control characters
       case 0:
@@ -119,7 +124,7 @@ bool clean_input_string(string &str) {
       default:
         // remove \xe2\x80[\xa8-\xae]
         if (c == 0xe2 && pos + 2 < str_size) {
-          unsigned char next = static_cast<unsigned char>(str[pos + 1]);
+          auto next = static_cast<unsigned char>(str[pos + 1]);
           if (next == 0x80) {
             next = static_cast<unsigned char>(str[pos + 2]);
             if (0xa8 <= next && next <= 0xae) {
@@ -130,7 +135,7 @@ bool clean_input_string(string &str) {
         }
         // remove vertical lines \xcc[\xb3\xbf\x8a]
         if (c == 0xcc && pos + 1 < str_size) {
-          unsigned char next = static_cast<unsigned char>(str[pos + 1]);
+          auto next = static_cast<unsigned char>(str[pos + 1]);
           if (next == 0xb3 || next == 0xbf || next == 0x8a) {
             pos++;
             break;
@@ -168,7 +173,7 @@ string strip_empty_characters(string str, size_t max_length, bool strip_rtlo) {
   }();
   CHECK(can_be_first_inited);
 
-  // replace all occurences of space characters with a space
+  // replace all occurrences of space characters with a space
   size_t i = 0;
   while (i < str.size() && !can_be_first[static_cast<unsigned char>(str[i])]) {
     i++;
@@ -240,12 +245,66 @@ bool is_empty_string(const string &str) {
   return strip_empty_characters(str, str.size()).empty();
 }
 
-int32 get_vector_hash(const vector<uint32> &numbers) {
-  uint32 acc = 0;
-  for (auto number : numbers) {
-    acc = acc * 20261 + number;
+bool is_valid_username(Slice username) {
+  if (username.empty() || username.size() > 32) {
+    return false;
   }
-  return static_cast<int32>(acc & 0x7FFFFFFF);
+  if (!is_alpha(username[0])) {
+    return false;
+  }
+  for (auto c : username) {
+    if (!is_alpha(c) && !is_digit(c) && c != '_') {
+      return false;
+    }
+  }
+  if (username.back() == '_') {
+    return false;
+  }
+  for (size_t i = 1; i < username.size(); i++) {
+    if (username[i - 1] == '_' && username[i] == '_') {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+bool is_allowed_username(Slice username) {
+  if (!is_valid_username(username)) {
+    return false;
+  }
+  if (username.size() < 5) {
+    return false;
+  }
+  auto username_lowered = to_lower(username);
+  if (username_lowered.find("admin") == 0 || username_lowered.find("telegram") == 0 ||
+      username_lowered.find("support") == 0 || username_lowered.find("security") == 0 ||
+      username_lowered.find("settings") == 0 || username_lowered.find("contacts") == 0 ||
+      username_lowered.find("service") == 0 || username_lowered.find("telegraph") == 0) {
+    return false;
+  }
+  return true;
+}
+
+uint64 get_md5_string_hash(const string &str) {
+  unsigned char hash[16];
+  md5(str, {hash, sizeof(hash)});
+  uint64 result = 0;
+  for (int i = 0; i <= 7; i++) {
+    result += static_cast<uint64>(hash[i]) << (56 - 8 * i);
+  }
+  return result;
+}
+
+int64 get_vector_hash(const vector<uint64> &numbers) {
+  uint64 acc = 0;
+  for (auto number : numbers) {
+    acc ^= acc >> 21;
+    acc ^= acc << 35;
+    acc ^= acc >> 4;
+    acc += number;
+  }
+  return static_cast<int64>(acc);
 }
 
 string get_emoji_fingerprint(uint64 num) {
@@ -305,73 +364,33 @@ string get_emoji_fingerprint(uint64 num) {
   return emojis[static_cast<size_t>((num & 0x7FFFFFFFFFFFFFFF) % emojis.size())].str();
 }
 
-static bool tolower_begins_with(Slice str, Slice prefix) {
-  if (prefix.size() > str.size()) {
-    return false;
-  }
-  for (size_t i = 0; i < prefix.size(); i++) {
-    if (to_lower(str[i]) != prefix[i]) {
-      return false;
-    }
-  }
-  return true;
+bool check_currency_amount(int64 amount) {
+  constexpr int64 MAX_AMOUNT = 9999'9999'9999;
+  return -MAX_AMOUNT <= amount && amount <= MAX_AMOUNT;
 }
 
-Result<string> check_url(Slice url) {
-  bool is_tg = false;
-  bool is_ton = false;
-  if (tolower_begins_with(url, "tg:")) {
-    url.remove_prefix(3);
-    is_tg = true;
-  } else if (tolower_begins_with(url, "ton:")) {
-    url.remove_prefix(4);
-    is_ton = true;
+Status validate_bot_language_code(const string &language_code) {
+  if (language_code.empty()) {
+    return Status::OK();
   }
-  if ((is_tg || is_ton) && begins_with(url, "//")) {
-    url.remove_prefix(2);
+  if (language_code.size() == 2 && 'a' <= language_code[0] && language_code[0] <= 'z' && 'a' <= language_code[1] &&
+      language_code[1] <= 'z') {
+    return Status::OK();
   }
-  TRY_RESULT(http_url, parse_url(url));
-  if (is_tg || is_ton) {
-    if (tolower_begins_with(url, "http://") || http_url.protocol_ == HttpUrl::Protocol::Https ||
-        !http_url.userinfo_.empty() || http_url.specified_port_ != 0 || http_url.is_ipv6_) {
-      return Status::Error(is_tg ? Slice("Wrong tg URL") : Slice("Wrong ton URL"));
-    }
-
-    Slice query(http_url.query_);
-    CHECK(query[0] == '/');
-    if (query[1] == '?') {
-      query.remove_prefix(1);
-    }
-    return PSTRING() << (is_tg ? "tg" : "ton") << "://" << http_url.host_ << query;
-  }
-
-  if (http_url.host_.find('.') == string::npos && !http_url.is_ipv6_) {
-    return Status::Error("Wrong HTTP URL");
-  }
-  return http_url.get_url();
+  return Status::Error(400, "Invalid language code specified");
 }
 
-string remove_emoji_modifiers(string emoji) {
-  static const Slice modifiers[] = {u8"\uFE0E" /* variation selector-15 */,
-                                    u8"\uFE0F" /* variation selector-16 */,
-                                    u8"\u200D\u2640" /* zero width joiner + female sign */,
-                                    u8"\u200D\u2642" /* zero width joiner + male sign */,
-                                    u8"\U0001F3FB" /* emoji modifier fitzpatrick type-1-2 */,
-                                    u8"\U0001F3FC" /* emoji modifier fitzpatrick type-3 */,
-                                    u8"\U0001F3FD" /* emoji modifier fitzpatrick type-4 */,
-                                    u8"\U0001F3FE" /* emoji modifier fitzpatrick type-5 */,
-                                    u8"\U0001F3FF" /* emoji modifier fitzpatrick type-6 */};
-  bool found = true;
-  while (found) {
-    found = false;
-    for (auto &modifier : modifiers) {
-      if (ends_with(emoji, modifier) && emoji.size() > modifier.size()) {
-        emoji.resize(emoji.size() - modifier.size());
-        found = true;
-      }
-    }
+vector<int32> search_strings_by_prefix(const vector<string> &strings, const string &query, int32 limit,
+                                       bool return_all_for_empty_query, int32 &total_count) {
+  Hints hints;
+  for (size_t i = 0; i < strings.size(); i++) {
+    const auto &str = strings[i];
+    hints.add(i, str.empty() ? Slice(" ") : Slice(str));
+    hints.set_rating(i, i);
   }
-  return emoji;
+  auto result = hints.search(query, limit, return_all_for_empty_query);
+  total_count = narrow_cast<int32>(result.first);
+  return transform(result.second, [](int64 key) { return narrow_cast<int32>(key); });
 }
 
 }  // namespace td

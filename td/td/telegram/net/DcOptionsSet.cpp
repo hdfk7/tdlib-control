@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -11,9 +11,10 @@
 
 #include "td/actor/actor.h"
 
+#include "td/utils/algorithm.h"
 #include "td/utils/format.h"
 #include "td/utils/logging.h"
-#include "td/utils/misc.h"
+#include "td/utils/SliceBuilder.h"
 
 #include <algorithm>
 #include <set>
@@ -92,7 +93,12 @@ vector<DcOptionsSet::ConnectionInfo> DcOptionsSet::find_all_connections(DcId dc_
     }
 
     if (only_http) {
-      if (!option.is_obfuscated_tcp_only() && !option.is_static() && (prefer_ipv6 || !option.is_ipv6())) {
+#if TD_DARWIN_WATCH_OS
+      bool allow_ipv6 = true;
+#else
+      bool allow_ipv6 = prefer_ipv6;
+#endif
+      if (!option.is_obfuscated_tcp_only() && !option.is_static() && (allow_ipv6 || !option.is_ipv6())) {
         info.use_http = true;
         info.stat = &option_stat->http_stat;
         options.push_back(info);
@@ -104,7 +110,7 @@ vector<DcOptionsSet::ConnectionInfo> DcOptionsSet::find_all_connections(DcId dc_
     if (!static_options.empty()) {
       options = std::move(static_options);
     } else {
-      bool have_ipv4 = std::any_of(options.begin(), options.end(), [](auto &v) { return !v.option->is_ipv6(); });
+      bool have_ipv4 = any_of(options, [](const auto &v) { return !v.option->is_ipv6(); });
       if (have_ipv4) {
         td::remove_if(options, [](auto &v) { return v.option->is_ipv6(); });
       }
@@ -116,13 +122,13 @@ vector<DcOptionsSet::ConnectionInfo> DcOptionsSet::find_all_connections(DcId dc_
   }
 
   if (prefer_ipv6) {
-    bool have_ipv6 = std::any_of(options.begin(), options.end(), [](auto &v) { return v.option->is_ipv6(); });
+    bool have_ipv6 = any_of(options, [](const auto &v) { return v.option->is_ipv6(); });
     if (have_ipv6) {
       td::remove_if(options, [](auto &v) { return !v.option->is_ipv6(); });
     }
   }
 
-  bool have_media_only = std::any_of(options.begin(), options.end(), [](auto &v) { return v.option->is_media_only(); });
+  bool have_media_only = any_of(options, [](const auto &v) { return v.option->is_media_only(); });
   if (have_media_only) {
     td::remove_if(options, [](auto &v) { return !v.option->is_media_only(); });
   }

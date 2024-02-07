@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -13,6 +13,7 @@
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
 #include "td/utils/port/Stat.h"
+#include "td/utils/SliceBuilder.h"
 
 #if TD_PORT_POSIX
 
@@ -20,6 +21,10 @@
 
 #if TD_ANDROID
 #include <sys/system_properties.h>
+#elif TD_EMSCRIPTEN
+#include <cstdlib>
+
+#include <emscripten.h>
 #else
 #if TD_DARWIN
 #include <sys/sysctl.h>
@@ -44,7 +49,7 @@ static string read_os_name(CSlice os_version_file_path, CSlice prefix, CSlice su
         auto end_pos = r_file.ok().find(suffix.c_str(), begin_pos);
         if (end_pos != string::npos) {
           auto os_version = trim(r_file.ok().substr(begin_pos, end_pos - begin_pos));
-          if (os_version.find("\n") == string::npos) {
+          if (os_version.find('\n') == string::npos) {
             return os_version;
           }
         }
@@ -90,6 +95,100 @@ Slice get_operating_system_version() {
     if (length > 0) {
       return "Android " + string(version, length);
     }
+#elif TD_EMSCRIPTEN
+    // clang-format off
+    char *os_name_js = (char*)EM_ASM_INT(({
+      function detectOsName() {
+        if (typeof process === 'object' && typeof process.platform === 'string') { // Node.js
+           switch (process.platform) {
+             case 'aix':
+               return 'IBM AIX';
+             case 'android':
+               return 'Android';
+             case 'darwin':
+               return 'macOS';
+             case 'freebsd':
+               return 'FreeBSD';
+             case 'linux':
+               return 'Linux';
+             case 'openbsd':
+               return 'OpenBSD';
+             case 'sunos':
+               return 'SunOS';
+             case 'win32':
+               return 'Windows';
+             case 'darwin':
+               return 'macOS';
+             default:
+               return 'Node.js';
+          }
+        }
+
+        var userAgent = 'Unknown';
+        if (typeof window === 'object') { // Web
+          userAgent = window.navigator.userAgent;
+        } else if (typeof importScripts === 'function') { // Web Worker
+          userAgent = navigator.userAgent;
+        }
+
+        var match = /(Mac OS|Mac OS X|MacPPC|MacIntel|Mac_PowerPC|Macintosh) ([._0-9]+)/.exec(userAgent);
+        if (match !== null) {
+          return 'macOS ' + match[2].replace('_', '.');
+        }
+
+        match = /Android [._0-9]+/.exec(userAgent);
+        if (match !== null) {
+          return match[0].replace('_', '.');
+        }
+
+        if (/(iPhone|iPad|iPod)/.test(userAgent)) {
+          match = /OS ([._0-9]+)/.exec(userAgent);
+          if (match !== null) {
+            return 'iOS ' + match[1].replace('_', '.');
+          }
+          return 'iOS';
+        }
+
+        var clientStrings = [
+          {s:'Windows 11', r:/(Windows 11|Windows NT 11)/},
+          // there is no way to distinguish Windows 10 from newer versions, so report it as just Windows.
+          // {s:'Windows 10 or later', r:/(Windows 10|Windows NT 10)/},
+          {s:'Windows 8.1', r:/(Windows 8.1|Windows NT 6.3)/},
+          {s:'Windows 8', r:/(Windows 8|Windows NT 6.2)/},
+          {s:'Windows 7', r:/(Windows 7|Windows NT 6.1)/},
+          {s:'Windows Vista', r:/Windows NT 6.0/},
+          {s:'Windows Server 2003', r:/Windows NT 5.2/},
+          {s:'Windows XP', r:/(Windows XP|Windows NT 5.1)/},
+          {s:'Windows', r:/Windows/},
+          {s:'Android', r:/Android/},
+          {s:'FreeBSD', r:/FreeBSD/},
+          {s:'OpenBSD', r:/OpenBSD/},
+          {s:'Chrome OS', r:/CrOS/},
+          {s:'Linux', r:/(Linux|X11)/},
+          {s:'macOS', r:/(Mac OS|MacPPC|MacIntel|Mac_PowerPC|Macintosh)/},
+          {s:'QNX', r:/QNX/},
+          {s:'BeOS', r:/BeOS/}
+        ];
+        for (var id in clientStrings) {
+          var cs = clientStrings[id];
+          if (cs.r.test(userAgent)) {
+            return cs.s;
+          }
+        }
+        return 'Emscripten';
+      }
+
+      var os_name = detectOsName();
+      var length = lengthBytesUTF8(os_name) + 1;
+      var result = _malloc(length);
+      stringToUTF8(os_name, result, length);
+      return result;
+    }));
+    // clang-format on
+    string os_name(os_name_js);
+    std::free(os_name_js);
+
+    return os_name;
 #else
 #if TD_LINUX
     auto os_name = read_os_name("/etc/os-release", "PRETTY_NAME=\"", "\"\n");
@@ -98,7 +197,7 @@ Slice get_operating_system_version() {
     }
 #endif
 
-    utsname name;
+    struct utsname name;
     int err = uname(&name);
     if (err == 0) {
       auto os_name = trim(PSTRING() << Slice(name.sysname, std::strlen(name.sysname)) << " "
@@ -124,8 +223,6 @@ Slice get_operating_system_version() {
     return "NetBSD";
 #elif TD_CYGWIN
     return "Cygwin";
-#elif TD_EMSCRIPTEN
-    return "Emscripten";
 #else
     return "Unix";
 #endif
@@ -135,7 +232,7 @@ Slice get_operating_system_version() {
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_SYSTEM)
     auto handle = GetModuleHandle(L"ntdll.dll");
     if (handle != nullptr) {
-      using RtlGetVersionPtr = LONG(WINAPI *)(PRTL_OSVERSIONINFOEXW);
+      using RtlGetVersionPtr = LONG(WINAPI *)(_Out_ PRTL_OSVERSIONINFOEXW);
       RtlGetVersionPtr RtlGetVersion = reinterpret_cast<RtlGetVersionPtr>(GetProcAddress(handle, "RtlGetVersion"));
       if (RtlGetVersion != nullptr) {
         RTL_OSVERSIONINFOEXW os_version_info = {};
@@ -145,9 +242,20 @@ Slice get_operating_system_version() {
           auto minor = os_version_info.dwMinorVersion;
           bool is_server = os_version_info.wProductType != VER_NT_WORKSTATION;
 
-          if (major == 10 && minor >= 0) {
+          if (major == 10) {
             if (is_server) {
-              return os_version_info.dwBuildNumber >= 17623 ? "Windows Server 2019" : "Windows Server 2016";
+              if (os_version_info.dwBuildNumber >= 20201) {
+                // https://techcommunity.microsoft.com/t5/windows-server-insiders/announcing/m-p/1614436
+                return "Windows Server 2022";
+              }
+              if (os_version_info.dwBuildNumber >= 17623) {
+                // https://techcommunity.microsoft.com/t5/windows-server-insiders/announcing/m-p/173715
+                return "Windows Server 2019";
+              }
+              return "Windows Server 2016";
+            }
+            if (os_version_info.dwBuildNumber >= 21900) {  // build numbers between 21391 and 21999 aren't used
+              return "Windows 11";
             }
             return "Windows 10";
           }

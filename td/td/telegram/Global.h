@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -8,17 +8,18 @@
 
 #include "td/telegram/DhConfig.h"
 #include "td/telegram/net/DcId.h"
+#include "td/telegram/net/MtprotoHeader.h"
 #include "td/telegram/net/NetQueryCreator.h"
-#include "td/telegram/TdParameters.h"
-
-#include "td/actor/actor.h"
-#include "td/actor/PromiseFuture.h"
-#include "td/actor/SchedulerLocalStorage.h"
 
 #include "td/net/NetStats.h"
 
+#include "td/actor/actor.h"
+#include "td/actor/SchedulerLocalStorage.h"
+
 #include "td/utils/common.h"
+#include "td/utils/FlatHashMap.h"
 #include "td/utils/logging.h"
+#include "td/utils/Promise.h"
 #include "td/utils/Slice.h"
 #include "td/utils/Status.h"
 #include "td/utils/Time.h"
@@ -26,49 +27,67 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
-#include <unordered_map>
 
 namespace td {
+
+class AccountManager;
 class AnimationsManager;
+class AttachMenuManager;
+class AuthManager;
+class AutosaveManager;
 class BackgroundManager;
+class BoostManager;
 class CallManager;
 class ConfigManager;
-class ConfigShared;
 class ConnectionCreator;
 class ContactsManager;
+class DialogActionManager;
+class DialogFilterManager;
+class DialogInviteLinkManager;
+class DialogManager;
+class DialogParticipantManager;
+class DownloadManager;
 class FileManager;
 class FileReferenceManager;
+class ForumTopicManager;
+class GameManager;
+class GroupCallManager;
 class LanguagePackManager;
+class LinkManager;
+class MessageImportManager;
 class MessagesManager;
-class MtprotoHeader;
 class NetQueryDispatcher;
 class NotificationManager;
+class NotificationSettingsManager;
+class OptionManager;
 class PasswordManager;
+class ReactionManager;
 class SecretChatsManager;
+class SponsoredMessageManager;
 class StateManager;
 class StickersManager;
 class StorageManager;
+class StoryManager;
 class Td;
 class TdDb;
 class TempAuthKeyWatchdog;
+class ThemeManager;
 class TopDialogManager;
+class TranscriptionManager;
 class UpdatesManager;
 class WebPagesManager;
-}  // namespace td
 
-namespace td {
-
-class Global : public ActorContext {
+class Global final : public ActorContext {
  public:
   Global();
-  ~Global() override;
+  ~Global() final;
   Global(const Global &) = delete;
   Global &operator=(const Global &) = delete;
-  Global(Global &&other) = delete;
-  Global &operator=(Global &&other) = delete;
+  Global(Global &&) = delete;
+  Global &operator=(Global &&) = delete;
 
   static constexpr int32 ID = -572104940;
-  int32 get_id() const override {
+  int32 get_id() const final {
     return ID;
   }
 
@@ -78,34 +97,31 @@ class Global : public ActorContext {
     return td_db_.get();
   }
 
-  void close_all(Promise<> on_finished);
-  void close_and_destroy_all(Promise<> on_finished);
+  void log_out(Slice reason);
 
-  Status init(const TdParameters &parameters, ActorId<Td> td, unique_ptr<TdDb> td_db_ptr) TD_WARN_UNUSED_RESULT;
+  void close_all(bool destroy_flag, Promise<> on_finished);
 
-  Slice get_dir() const {
-    return parameters_.database_directory;
-  }
+  Status init(ActorId<Td> td, unique_ptr<TdDb> td_db_ptr) TD_WARN_UNUSED_RESULT;
+
+  Slice get_dir() const;
+
   Slice get_secure_files_dir() const {
     if (store_all_files_in_files_directory_) {
       return get_files_dir();
     }
     return get_dir();
   }
-  Slice get_files_dir() const {
-    return parameters_.files_directory;
-  }
-  bool is_test_dc() const {
-    return parameters_.use_test_dc;
-  }
 
-  bool ignore_backgrond_updates() const;
+  Slice get_files_dir() const;
+
+  bool is_test_dc() const;
 
   NetQueryCreator &net_query_creator() {
     return *net_query_creator_.get();
   }
 
   void set_net_query_stats(std::shared_ptr<NetQueryStats> net_query_stats);
+
   void set_net_query_dispatcher(unique_ptr<NetQueryDispatcher> net_query_dispatcher);
 
   NetQueryDispatcher &net_query_dispatcher() {
@@ -117,33 +133,33 @@ class Global : public ActorContext {
     return net_query_dispatcher_.get() != nullptr;
   }
 
-  void set_shared_config(unique_ptr<ConfigShared> shared_config);
+  void set_option_empty(Slice name);
 
-  ConfigShared &shared_config() {
-    CHECK(shared_config_.get() != nullptr);
-    return *shared_config_;
-  }
+  void set_option_boolean(Slice name, bool value);
+
+  void set_option_integer(Slice name, int64 value);
+
+  void set_option_string(Slice name, Slice value);
+
+  bool have_option(Slice name) const;
+
+  bool get_option_boolean(Slice name, bool default_value = false) const;
+
+  int64 get_option_integer(Slice name, int64 default_value = 0) const;
+
+  string get_option_string(Slice name, string default_value = "") const;
 
   bool is_server_time_reliable() const {
-    return server_time_difference_was_updated_;
-  }
-  double to_server_time(double now) const {
-    return now + get_server_time_difference();
+    return server_time_difference_was_updated_.load(std::memory_order_relaxed);
   }
   double server_time() const {
-    return to_server_time(Time::now());
-  }
-  double server_time_cached() const {
-    return to_server_time(Time::now_cached());
+    return Time::now() + get_server_time_difference();
   }
   int32 unix_time() const {
     return to_unix_time(server_time());
   }
-  int32 unix_time_cached() const {
-    return to_unix_time(server_time_cached());
-  }
 
-  void update_server_time_difference(double diff);
+  void update_server_time_difference(double diff, bool force);
 
   void save_server_time();
 
@@ -166,6 +182,13 @@ class Global : public ActorContext {
     return td_;
   }
 
+  ActorId<AccountManager> account_manager() const {
+    return account_manager_;
+  }
+  void set_account_manager(ActorId<AccountManager> account_manager) {
+    account_manager_ = account_manager;
+  }
+
   ActorId<AnimationsManager> animations_manager() const {
     return animations_manager_;
   }
@@ -173,11 +196,36 @@ class Global : public ActorContext {
     animations_manager_ = animations_manager;
   }
 
+  ActorId<AttachMenuManager> attach_menu_manager() const {
+    return attach_menu_manager_;
+  }
+  void set_attach_menu_manager(ActorId<AttachMenuManager> attach_menu_manager) {
+    attach_menu_manager_ = attach_menu_manager;
+  }
+
+  void set_auth_manager(ActorId<AuthManager> auth_manager) {
+    auth_manager_ = auth_manager;
+  }
+
+  ActorId<AutosaveManager> autosave_manager() const {
+    return autosave_manager_;
+  }
+  void set_autosave_manager(ActorId<AutosaveManager> autosave_manager) {
+    autosave_manager_ = autosave_manager;
+  }
+
   ActorId<BackgroundManager> background_manager() const {
     return background_manager_;
   }
   void set_background_manager(ActorId<BackgroundManager> background_manager) {
     background_manager_ = background_manager;
+  }
+
+  ActorId<BoostManager> boost_manager() const {
+    return boost_manager_;
+  }
+  void set_boost_manager(ActorId<BoostManager> boost_manager) {
+    boost_manager_ = boost_manager;
   }
 
   ActorId<CallManager> call_manager() const {
@@ -201,6 +249,48 @@ class Global : public ActorContext {
     contacts_manager_ = contacts_manager;
   }
 
+  ActorId<DialogActionManager> dialog_action_manager() const {
+    return dialog_action_manager_;
+  }
+  void set_dialog_action_manager(ActorId<DialogActionManager> dialog_action_manager) {
+    dialog_action_manager_ = std::move(dialog_action_manager);
+  }
+
+  ActorId<DialogFilterManager> dialog_filter_manager() const {
+    return dialog_filter_manager_;
+  }
+  void set_dialog_filter_manager(ActorId<DialogFilterManager> dialog_filter_manager) {
+    dialog_filter_manager_ = std::move(dialog_filter_manager);
+  }
+
+  ActorId<DialogInviteLinkManager> dialog_invite_link_manager() const {
+    return dialog_invite_link_manager_;
+  }
+  void set_dialog_invite_link_manager(ActorId<DialogInviteLinkManager> dialog_invite_link_manager) {
+    dialog_invite_link_manager_ = std::move(dialog_invite_link_manager);
+  }
+
+  ActorId<DialogManager> dialog_manager() const {
+    return dialog_manager_;
+  }
+  void set_dialog_manager(ActorId<DialogManager> dialog_manager) {
+    dialog_manager_ = std::move(dialog_manager);
+  }
+
+  ActorId<DialogParticipantManager> dialog_participant_manager() const {
+    return dialog_participant_manager_;
+  }
+  void set_dialog_participant_manager(ActorId<DialogParticipantManager> dialog_participant_manager) {
+    dialog_participant_manager_ = std::move(dialog_participant_manager);
+  }
+
+  ActorId<DownloadManager> download_manager() const {
+    return download_manager_;
+  }
+  void set_download_manager(ActorId<DownloadManager> download_manager) {
+    download_manager_ = std::move(download_manager);
+  }
+
   ActorId<FileManager> file_manager() const {
     return file_manager_;
   }
@@ -215,11 +305,46 @@ class Global : public ActorContext {
     file_reference_manager_ = std::move(file_reference_manager);
   }
 
+  ActorId<ForumTopicManager> forum_topic_manager() const {
+    return forum_topic_manager_;
+  }
+  void set_forum_topic_manager(ActorId<ForumTopicManager> forum_topic_manager) {
+    forum_topic_manager_ = forum_topic_manager;
+  }
+
+  ActorId<GameManager> game_manager() const {
+    return game_manager_;
+  }
+  void set_game_manager(ActorId<GameManager> game_manager) {
+    game_manager_ = game_manager;
+  }
+
+  ActorId<GroupCallManager> group_call_manager() const {
+    return group_call_manager_;
+  }
+  void set_group_call_manager(ActorId<GroupCallManager> group_call_manager) {
+    group_call_manager_ = group_call_manager;
+  }
+
   ActorId<LanguagePackManager> language_pack_manager() const {
     return language_pack_manager_;
   }
   void set_language_pack_manager(ActorId<LanguagePackManager> language_pack_manager) {
     language_pack_manager_ = language_pack_manager;
+  }
+
+  ActorId<LinkManager> link_manager() const {
+    return link_manager_;
+  }
+  void set_link_manager(ActorId<LinkManager> link_manager) {
+    link_manager_ = link_manager;
+  }
+
+  ActorId<MessageImportManager> message_import_manager() const {
+    return message_import_manager_;
+  }
+  void set_message_import_manager(ActorId<MessageImportManager> message_import_manager) {
+    message_import_manager_ = message_import_manager;
   }
 
   ActorId<MessagesManager> messages_manager() const {
@@ -236,6 +361,18 @@ class Global : public ActorContext {
     notification_manager_ = notification_manager;
   }
 
+  ActorId<NotificationSettingsManager> notification_settings_manager() const {
+    return notification_settings_manager_;
+  }
+  void set_notification_settings_manager(ActorId<NotificationSettingsManager> notification_settings_manager) {
+    notification_settings_manager_ = notification_settings_manager;
+  }
+
+  void set_option_manager(OptionManager *option_manager) {
+    option_manager_ = option_manager;
+  }
+  OptionManager *get_option_manager();
+
   ActorId<PasswordManager> password_manager() const {
     return password_manager_;
   }
@@ -243,11 +380,25 @@ class Global : public ActorContext {
     password_manager_ = password_manager;
   }
 
+  ActorId<ReactionManager> reaction_manager() const {
+    return reaction_manager_;
+  }
+  void set_reaction_manager(ActorId<ReactionManager> reaction_manager) {
+    reaction_manager_ = reaction_manager;
+  }
+
   ActorId<SecretChatsManager> secret_chats_manager() const {
     return secret_chats_manager_;
   }
   void set_secret_chats_manager(ActorId<SecretChatsManager> secret_chats_manager) {
     secret_chats_manager_ = secret_chats_manager;
+  }
+
+  ActorId<SponsoredMessageManager> sponsored_message_manager() const {
+    return sponsored_message_manager_;
+  }
+  void set_sponsored_message_manager(ActorId<SponsoredMessageManager> sponsored_message_manager) {
+    sponsored_message_manager_ = sponsored_message_manager;
   }
 
   ActorId<StickersManager> stickers_manager() const {
@@ -264,11 +415,32 @@ class Global : public ActorContext {
     storage_manager_ = storage_manager;
   }
 
+  ActorId<StoryManager> story_manager() const {
+    return story_manager_;
+  }
+  void set_story_manager(ActorId<StoryManager> story_manager) {
+    story_manager_ = story_manager;
+  }
+
+  ActorId<ThemeManager> theme_manager() const {
+    return theme_manager_;
+  }
+  void set_theme_manager(ActorId<ThemeManager> theme_manager) {
+    theme_manager_ = theme_manager;
+  }
+
   ActorId<TopDialogManager> top_dialog_manager() const {
     return top_dialog_manager_;
   }
   void set_top_dialog_manager(ActorId<TopDialogManager> top_dialog_manager) {
     top_dialog_manager_ = top_dialog_manager;
+  }
+
+  ActorId<TranscriptionManager> transcription_manager() const {
+    return transcription_manager_;
+  }
+  void set_transcription_manager(ActorId<TranscriptionManager> transcription_manager) {
+    transcription_manager_ = transcription_manager;
   }
 
   ActorId<UpdatesManager> updates_manager() const {
@@ -297,15 +469,20 @@ class Global : public ActorContext {
     return mtproto_header_ != nullptr;
   }
 
-  const TdParameters &parameters() const {
-    return parameters_;
+  bool use_file_database() const;
+
+  bool use_sqlite_pmc() const;
+
+  bool use_chat_info_database() const;
+
+  bool use_message_database() const;
+
+  bool keep_media_order() const {
+    return use_file_database();
   }
 
-  int32 get_my_id() const {
-    return my_id_;
-  }
-  void set_my_id(int32 my_id) {
-    my_id_ = my_id;
+  int32 get_database_scheduler_id() {
+    return database_scheduler_id_;
   }
 
   int32 get_gc_scheduler_id() const {
@@ -331,10 +508,21 @@ class Global : public ActorContext {
   void set_dh_config(std::shared_ptr<DhConfig> new_dh_config) {
 #if !TD_HAVE_ATOMIC_SHARED_PTR
     std::lock_guard<std::mutex> guard(dh_config_mutex_);
-    dh_config_ = new_dh_config;
+    dh_config_ = std::move(new_dh_config);
 #else
     atomic_store(&dh_config_, std::move(new_dh_config));
 #endif
+  }
+
+  static Status request_aborted_error() {
+    return Status::Error(500, "Request aborted");
+  }
+
+  template <class T>
+  void ignore_result_if_closing(Result<T> &result) const {
+    if (close_flag() && result.is_ok()) {
+      result = request_aborted_error();
+    }
   }
 
   void set_close_flag() {
@@ -342,6 +530,10 @@ class Global : public ActorContext {
   }
   bool close_flag() const {
     return close_flag_.load();
+  }
+
+  Status close_status() const {
+    return close_flag() ? request_aborted_error() : Status::OK();
   }
 
   bool is_expected_error(const Status &error) const {
@@ -355,6 +547,12 @@ class Global : public ActorContext {
       return true;
     }
     return close_flag();
+  }
+
+  static int32 get_retry_after(int32 error_code, Slice error_message);
+
+  static int32 get_retry_after(const Status &error) {
+    return get_retry_after(error.code(), error.message());
   }
 
   const std::vector<std::shared_ptr<NetStatsCallback>> &get_net_stats_file_callbacks() {
@@ -378,21 +576,43 @@ class Global : public ActorContext {
   unique_ptr<TdDb> td_db_;
 
   ActorId<Td> td_;
+  ActorId<AccountManager> account_manager_;
   ActorId<AnimationsManager> animations_manager_;
+  ActorId<AttachMenuManager> attach_menu_manager_;
+  ActorId<AuthManager> auth_manager_;
+  ActorId<AutosaveManager> autosave_manager_;
   ActorId<BackgroundManager> background_manager_;
+  ActorId<BoostManager> boost_manager_;
   ActorId<CallManager> call_manager_;
   ActorId<ConfigManager> config_manager_;
   ActorId<ContactsManager> contacts_manager_;
+  ActorId<DialogActionManager> dialog_action_manager_;
+  ActorId<DialogFilterManager> dialog_filter_manager_;
+  ActorId<DialogInviteLinkManager> dialog_invite_link_manager_;
+  ActorId<DialogManager> dialog_manager_;
+  ActorId<DialogParticipantManager> dialog_participant_manager_;
+  ActorId<DownloadManager> download_manager_;
   ActorId<FileManager> file_manager_;
   ActorId<FileReferenceManager> file_reference_manager_;
+  ActorId<ForumTopicManager> forum_topic_manager_;
+  ActorId<GameManager> game_manager_;
+  ActorId<GroupCallManager> group_call_manager_;
   ActorId<LanguagePackManager> language_pack_manager_;
+  ActorId<LinkManager> link_manager_;
+  ActorId<MessageImportManager> message_import_manager_;
   ActorId<MessagesManager> messages_manager_;
   ActorId<NotificationManager> notification_manager_;
+  ActorId<NotificationSettingsManager> notification_settings_manager_;
   ActorId<PasswordManager> password_manager_;
+  ActorId<ReactionManager> reaction_manager_;
   ActorId<SecretChatsManager> secret_chats_manager_;
+  ActorId<SponsoredMessageManager> sponsored_message_manager_;
   ActorId<StickersManager> stickers_manager_;
   ActorId<StorageManager> storage_manager_;
+  ActorId<StoryManager> story_manager_;
+  ActorId<ThemeManager> theme_manager_;
   ActorId<TopDialogManager> top_dialog_manager_;
+  ActorId<TranscriptionManager> transcription_manager_;
   ActorId<UpdatesManager> updates_manager_;
   ActorId<WebPagesManager> web_pages_manager_;
   ActorOwn<ConnectionCreator> connection_creator_;
@@ -400,9 +620,11 @@ class Global : public ActorContext {
 
   unique_ptr<MtprotoHeader> mtproto_header_;
 
-  TdParameters parameters_;
-  int32 gc_scheduler_id_;
-  int32 slow_net_scheduler_id_;
+  OptionManager *option_manager_ = nullptr;
+
+  int32 database_scheduler_id_ = 0;
+  int32 gc_scheduler_id_ = 0;
+  int32 slow_net_scheduler_id_ = 0;
 
   std::atomic<bool> store_all_files_in_files_directory_{false};
 
@@ -426,15 +648,13 @@ class Global : public ActorContext {
   LazySchedulerLocalStorage<unique_ptr<NetQueryCreator>> net_query_creator_;
   unique_ptr<NetQueryDispatcher> net_query_dispatcher_;
 
-  unique_ptr<ConfigShared> shared_config_;
-
-  int32 my_id_ = 0;  // hack
-
   static int64 get_location_key(double latitude, double longitude);
 
-  std::unordered_map<int64, int64> location_access_hashes_;
+  FlatHashMap<int64, int64> location_access_hashes_;
 
   int32 to_unix_time(double server_time) const;
+
+  const OptionManager *get_option_manager() const;
 
   void do_save_server_time_difference();
 
@@ -445,8 +665,8 @@ class Global : public ActorContext {
 
 inline Global *G_impl(const char *file, int line) {
   ActorContext *context = Scheduler::context();
-  CHECK(context);
-  LOG_CHECK(context->get_id() == Global::ID) << "In " << file << " at " << line;
+  LOG_CHECK(context != nullptr && context->get_id() == Global::ID)
+      << "Context = " << context << " in " << file << " at " << line;
   return static_cast<Global *>(context);
 }
 

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -8,7 +8,7 @@
 
 #include "td/utils/common.h"
 #include "td/utils/logging.h"
-#include "td/utils/port/thread.h"
+#include "td/utils/port/sleep.h"
 
 #include <algorithm>
 #include <atomic>
@@ -25,21 +25,21 @@ class MpmcEagerWaiter {
     int yields;
     uint32 worker_id;
   };
-  void init_slot(Slot &slot, uint32 worker_id) {
+  static void init_slot(Slot &slot, uint32 worker_id) {
     slot.yields = 0;
     slot.worker_id = worker_id;
   }
+
   void wait(Slot &slot) {
     if (slot.yields < RoundsTillSleepy) {
-      td::this_thread::yield();
+      yield();
       slot.yields++;
-      return;
     } else if (slot.yields == RoundsTillSleepy) {
       auto state = state_.load(std::memory_order_relaxed);
       if (!State::has_worker(state)) {
         auto new_state = State::with_worker(state, slot.worker_id);
         if (state_.compare_exchange_strong(state, new_state, std::memory_order_acq_rel)) {
-          td::this_thread::yield();
+          yield();
           slot.yields++;
           return;
         }
@@ -48,18 +48,16 @@ class MpmcEagerWaiter {
           return;
         }
       }
-      td::this_thread::yield();
+      yield();
       slot.yields = 0;
-      return;
     } else if (slot.yields < RoundsTillAsleep) {
       auto state = state_.load(std::memory_order_acquire);
       if (State::still_sleepy(state, slot.worker_id)) {
-        td::this_thread::yield();
+        yield();
         slot.yields++;
         return;
       }
       slot.yields = 0;
-      return;
     } else {
       auto state = state_.load(std::memory_order_acquire);
       if (State::still_sleepy(state, slot.worker_id)) {
@@ -69,7 +67,6 @@ class MpmcEagerWaiter {
         }
       }
       slot.yields = 0;
-      return;
     }
   }
 
@@ -78,7 +75,6 @@ class MpmcEagerWaiter {
       notify_cold();
     }
     slot.yields = 0;
-    return;
   }
 
   void close() {
@@ -125,6 +121,10 @@ class MpmcEagerWaiter {
       std::lock_guard<std::mutex> guard(mutex_);
       condition_variable_.notify_all();
     }
+  }
+  static void yield() {
+    // whatever, this is better than sched_yield
+    usleep_for(1);
   }
 };
 
@@ -186,16 +186,15 @@ class MpmcSleepyWaiter {
   // This may put it in a Sleep for some time.
   // After wait returns worker will be in Search state again.
   //
-  // Suppose worker found a work and ready to process it.
-  // Then it may call stop_wait. This will cause transition from
-  // Search to Work state.
+  // If a worker found a work and ready to process it, then it may call stop_wait.
+  // This will cause transition from Search to Work state.
   //
   // Main invariant:
   // After notify is called there should be at least on worker in Search or Work state.
   // If possible - in Search state
   //
 
-  void init_slot(Slot &slot, int32 worker_id) {
+  static void init_slot(Slot &slot, int32 worker_id) {
     slot.state_ = Slot::State::Work;
     slot.unpark_flag_ = false;
     slot.worker_id = worker_id;
@@ -213,7 +212,7 @@ class MpmcSleepyWaiter {
     }
     if (slot.state_ == Slot::Search) {
       if (slot.yield_cnt++ < 10 && false) {
-        td::this_thread::yield();
+        // TODO some sleep backoff is possible
         return;
       }
 
@@ -260,7 +259,7 @@ class MpmcSleepyWaiter {
         guard.unlock();
       } else {
         guard.unlock();
-        VLOG(waiter) << "Not in sleepers" << slot.worker_id;
+        VLOG(waiter) << "Not in sleepers " << slot.worker_id;
         CHECK(slot.cancel_park());
       }
     }
@@ -282,16 +281,16 @@ class MpmcSleepyWaiter {
     auto view = StateView(state_.load());
     //LOG(ERROR) << view.parked_count;
     if (view.searching_count > 0 || view.parked_count == 0) {
-      VLOG(waiter) << "Ingore notify: " << view.searching_count << " " << view.parked_count;
+      VLOG(waiter) << "Ingore notify: " << view.searching_count << ' ' << view.parked_count;
       return;
     }
 
-    VLOG(waiter) << "Notify: " << view.searching_count << " " << view.parked_count;
+    VLOG(waiter) << "Notify: " << view.searching_count << ' ' << view.parked_count;
     std::unique_lock<std::mutex> guard(sleepers_mutex_);
 
     view = StateView(state_.load());
     if (view.searching_count > 0) {
-      VLOG(waiter) << "Skip notify: got searching";
+      VLOG(waiter) << "Skip notify: search is active";
       return;
     }
 

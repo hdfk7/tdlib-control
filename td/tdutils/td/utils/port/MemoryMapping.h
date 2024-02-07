@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -37,10 +37,10 @@ class MemoryMapping {
   Slice as_slice() const;
   MutableSlice as_mutable_slice();  // returns empty slice if memory is read-only
 
-  MemoryMapping(const MemoryMapping &other) = delete;
-  const MemoryMapping &operator=(const MemoryMapping &other) = delete;
-  MemoryMapping(MemoryMapping &&other);
-  MemoryMapping &operator=(MemoryMapping &&other);
+  MemoryMapping(const MemoryMapping &) = delete;
+  MemoryMapping &operator=(const MemoryMapping &) = delete;
+  MemoryMapping(MemoryMapping &&other) noexcept;
+  MemoryMapping &operator=(MemoryMapping &&other) noexcept;
   ~MemoryMapping();
 
  private:

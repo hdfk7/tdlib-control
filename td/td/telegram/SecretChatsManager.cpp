@@ -1,30 +1,27 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/SecretChatsManager.h"
 
-#include "td/telegram/ConfigShared.h"
 #include "td/telegram/ContactsManager.h"
 #include "td/telegram/DhCache.h"
+#include "td/telegram/EncryptedFile.h"
 #include "td/telegram/FolderId.h"
 #include "td/telegram/Global.h"
 #include "td/telegram/logevent/SecretChatEvent.h"
 #include "td/telegram/MessageId.h"
 #include "td/telegram/MessagesManager.h"
 #include "td/telegram/net/NetQueryDispatcher.h"
+#include "td/telegram/SecretChatDb.h"
 #include "td/telegram/SequenceDispatcher.h"
 #include "td/telegram/StateManager.h"
 #include "td/telegram/TdDb.h"
+#include "td/telegram/telegram_api.h"
 
-#include "td/telegram/secret_api.h"
-#include "td/telegram/telegram_api.hpp"
-
-#include "td/mtproto/DhHandshake.h"
-
-#include "td/actor/PromiseFuture.h"
+#include "td/mtproto/DhCallback.h"
 
 #include "td/db/binlog/BinlogEvent.h"
 #include "td/db/binlog/BinlogHelper.h"
@@ -34,6 +31,7 @@
 #include "td/utils/format.h"
 #include "td/utils/logging.h"
 #include "td/utils/Random.h"
+#include "td/utils/SliceBuilder.h"
 #include "td/utils/Status.h"
 #include "td/utils/Time.h"
 
@@ -72,20 +70,20 @@ namespace td {
 // TODO
 // Just fail chat.
 
-SecretChatsManager::SecretChatsManager(ActorShared<> parent) : parent_(std::move(parent)) {
+SecretChatsManager::SecretChatsManager(ActorShared<> parent, bool use_secret_chats)
+    : use_secret_chats_(use_secret_chats), parent_(std::move(parent)) {
 }
 
 void SecretChatsManager::start_up() {
-  if (!G()->parameters().use_secret_chats) {
-    dummy_mode_ = true;
+  if (!use_secret_chats_) {
     return;
   }
 
-  class StateCallback : public StateManager::Callback {
+  class StateCallback final : public StateManager::Callback {
    public:
     explicit StateCallback(ActorId<SecretChatsManager> parent) : parent_(std::move(parent)) {
     }
-    bool on_online(bool online_flag) override {
+    bool on_online(bool online_flag) final {
       send_closure(parent_, &SecretChatsManager::on_online, online_flag);
       return parent_.is_alive();
     }
@@ -96,7 +94,7 @@ void SecretChatsManager::start_up() {
   send_closure(G()->state_manager(), &StateManager::add_callback, make_unique<StateCallback>(actor_id(this)));
 }
 
-void SecretChatsManager::create_chat(int32 user_id, int64 user_access_hash, Promise<SecretChatId> promise) {
+void SecretChatsManager::create_chat(UserId user_id, int64 user_access_hash, Promise<SecretChatId> promise) {
   int32 random_id;
   ActorId<SecretChatActor> actor;
   do {
@@ -106,10 +104,10 @@ void SecretChatsManager::create_chat(int32 user_id, int64 user_access_hash, Prom
   send_closure(actor, &SecretChatActor::create_chat, user_id, user_access_hash, random_id, std::move(promise));
 }
 
-void SecretChatsManager::cancel_chat(SecretChatId secret_chat_id, Promise<> promise) {
+void SecretChatsManager::cancel_chat(SecretChatId secret_chat_id, bool delete_history, Promise<> promise) {
   auto actor = get_chat_actor(secret_chat_id.get());
   auto safe_promise = SafePromise<>(std::move(promise), Unit());
-  send_closure(actor, &SecretChatActor::cancel_chat, std::move(safe_promise));
+  send_closure(actor, &SecretChatActor::cancel_chat, delete_history, false, std::move(safe_promise));
 }
 
 void SecretChatsManager::send_message(SecretChatId secret_chat_id, tl_object_ptr<secret_api::decryptedMessage> message,
@@ -164,56 +162,79 @@ void SecretChatsManager::send_set_ttl_message(SecretChatId secret_chat_id, int32
 }
 
 void SecretChatsManager::on_update_chat(tl_object_ptr<telegram_api::updateEncryption> update) {
-  if (dummy_mode_ || close_flag_) {
+  if (!use_secret_chats_ || close_flag_) {
     return;
   }
-  bool chat_requested = update->chat_->get_id() == telegram_api::encryptedChatRequested::ID;
-  pending_chat_updates_.push_back({Timestamp::in(chat_requested ? 1 : 0), std::move(update)});
+  PendingChatUpdate pending_update;
+  pending_update.online_process_time_ = Timestamp::now();
+  if (update->chat_->get_id() == telegram_api::encryptedChatRequested::ID) {
+#if TD_ANDROID || TD_DARWIN_IOS || TD_DARWIN_WATCH_OS || TD_TIZEN
+    pending_update.offline_process_time_ = Timestamp::in(1.0);
+#else
+    pending_update.online_process_time_ = Timestamp::in(2.0);
+    pending_update.offline_process_time_ = Timestamp::in(3.0);
+#endif
+  }
+  pending_update.update_ = std::move(update);
+
+  pending_chat_updates_.push_back(std::move(pending_update));
   flush_pending_chat_updates();
 }
 
 void SecretChatsManager::do_update_chat(tl_object_ptr<telegram_api::updateEncryption> update) {
-  int32 id = 0;
-  downcast_call(*update->chat_, [&](auto &x) { id = x.id_; });
-
-  send_closure(
-      update->chat_->get_id() == telegram_api::encryptedChatDiscarded::ID ? get_chat_actor(id) : create_chat_actor(id),
-      &SecretChatActor::update_chat, std::move(update->chat_));
+  auto actor_id = [this, chat = update->chat_.get()] {
+    switch (chat->get_id()) {
+      case telegram_api::encryptedChatEmpty::ID:
+        return create_chat_actor(static_cast<const telegram_api::encryptedChatEmpty *>(chat)->id_);
+      case telegram_api::encryptedChatWaiting::ID:
+        return create_chat_actor(static_cast<const telegram_api::encryptedChatWaiting *>(chat)->id_);
+      case telegram_api::encryptedChatRequested::ID:
+        return create_chat_actor(static_cast<const telegram_api::encryptedChatRequested *>(chat)->id_);
+      case telegram_api::encryptedChat::ID:
+        return create_chat_actor(static_cast<const telegram_api::encryptedChat *>(chat)->id_);
+      case telegram_api::encryptedChatDiscarded::ID:
+        return get_chat_actor(static_cast<const telegram_api::encryptedChatDiscarded *>(chat)->id_);
+      default:
+        UNREACHABLE();
+        return ActorId<SecretChatActor>();
+    }
+  }();
+  send_closure(actor_id, &SecretChatActor::update_chat, std::move(update->chat_));
 }
 
 void SecretChatsManager::on_new_message(tl_object_ptr<telegram_api::EncryptedMessage> &&message_ptr,
                                         Promise<Unit> &&promise) {
-  if (dummy_mode_ || close_flag_) {
-    return;
+  if (!use_secret_chats_ || close_flag_) {
+    return promise.set_value(Unit());
   }
   CHECK(message_ptr != nullptr);
 
   auto event = make_unique<log_event::InboundSecretMessage>();
   event->promise = std::move(promise);
-  downcast_call(*message_ptr, [&](auto &x) {
-    event->chat_id = x.chat_id_;
-    event->date = x.date_;
-    event->encrypted_message = std::move(x.bytes_);
-  });
-  if (message_ptr->get_id() == telegram_api::encryptedMessage::ID) {
-    auto message = move_tl_object_as<telegram_api::encryptedMessage>(message_ptr);
-    if (message->file_->get_id() == telegram_api::encryptedFile::ID) {
-      auto file = move_tl_object_as<telegram_api::encryptedFile>(message->file_);
-
-      event->file.id = file->id_;
-      event->file.access_hash = file->access_hash_;
-      event->file.size = file->size_;
-      event->file.dc_id = file->dc_id_;
-      event->file.key_fingerprint = file->key_fingerprint_;
-
-      event->has_encrypted_file = true;
+  switch (message_ptr->get_id()) {
+    case telegram_api::encryptedMessage::ID: {
+      auto message = telegram_api::move_object_as<telegram_api::encryptedMessage>(message_ptr);
+      event->chat_id = message->chat_id_;
+      event->date = message->date_;
+      event->encrypted_message = std::move(message->bytes_);
+      event->file = EncryptedFile::get_encrypted_file(std::move(message->file_));
+      break;
     }
+    case telegram_api::encryptedMessageService::ID: {
+      auto message = telegram_api::move_object_as<telegram_api::encryptedMessageService>(message_ptr);
+      event->chat_id = message->chat_id_;
+      event->date = message->date_;
+      event->encrypted_message = std::move(message->bytes_);
+      break;
+    }
+    default:
+      UNREACHABLE();
   }
   add_inbound_message(std::move(event));
 }
 
 void SecretChatsManager::replay_binlog_event(BinlogEvent &&binlog_event) {
-  if (dummy_mode_) {
+  if (!use_secret_chats_) {
     binlog_erase(G()->td_db()->get_binlog(), binlog_event.id_);
     return;
   }
@@ -235,8 +256,9 @@ void SecretChatsManager::replay_binlog_event(BinlogEvent &&binlog_event) {
     case log_event::SecretChatEvent::Type::CreateSecretChat:
       return replay_create_chat(
           unique_ptr<log_event::CreateSecretChat>(static_cast<log_event::CreateSecretChat *>(message.release())));
+    default:
+      LOG(FATAL) << "Unknown log event type " << tag("type", format::as_hex(static_cast<int32>(message->get_type())));
   }
-  LOG(FATAL) << "Unknown log event type " << tag("type", format::as_hex(static_cast<int32>(message->get_type())));
 }
 
 void SecretChatsManager::binlog_replay_finish() {
@@ -289,39 +311,39 @@ ActorId<SecretChatActor> SecretChatsManager::create_chat_actor(int32 id) {
 }
 
 unique_ptr<SecretChatActor::Context> SecretChatsManager::make_secret_chat_context(int32 id) {
-  class Context : public SecretChatActor::Context {
+  class Context final : public SecretChatActor::Context {
    public:
     Context(int32 id, ActorShared<SecretChatsManager> parent, unique_ptr<SecretChatDb> secret_chat_db)
         : secret_chat_id_(SecretChatId(id)), parent_(std::move(parent)), secret_chat_db_(std::move(secret_chat_db)) {
       sequence_dispatcher_ = create_actor<SequenceDispatcher>("SecretChat SequenceDispatcher");
     }
-    Context(const Context &other) = delete;
-    Context &operator=(const Context &other) = delete;
-    Context(Context &&other) = delete;
-    Context &operator=(Context &&other) = delete;
-    ~Context() override {
+    Context(const Context &) = delete;
+    Context &operator=(const Context &) = delete;
+    Context(Context &&) = delete;
+    Context &operator=(Context &&) = delete;
+    ~Context() final {
       send_closure(std::move(sequence_dispatcher_), &SequenceDispatcher::close_silent);
     }
 
-    DhCallback *dh_callback() override {
+    mtproto::DhCallback *dh_callback() final {
       return DhCache::instance();
     }
-    NetQueryCreator &net_query_creator() override {
+    NetQueryCreator &net_query_creator() final {
       return G()->net_query_creator();
     }
-    BinlogInterface *binlog() override {
+    BinlogInterface *binlog() final {
       return G()->td_db()->get_binlog();
     }
-    SecretChatDb *secret_chat_db() override {
+    SecretChatDb *secret_chat_db() final {
       return secret_chat_db_.get();
     }
-    std::shared_ptr<DhConfig> dh_config() override {
+    std::shared_ptr<DhConfig> dh_config() final {
       return G()->get_dh_config();
     }
-    void set_dh_config(std::shared_ptr<DhConfig> dh_config) override {
+    void set_dh_config(std::shared_ptr<DhConfig> dh_config) final {
       G()->set_dh_config(std::move(dh_config));
     }
-    void send_net_query(NetQueryPtr query, ActorShared<NetQueryCallback> callback, bool ordered) override {
+    void send_net_query(NetQueryPtr query, ActorShared<NetQueryCallback> callback, bool ordered) final {
       if (ordered) {
         send_closure(sequence_dispatcher_, &SequenceDispatcher::send_with_callback, std::move(query),
                      std::move(callback));
@@ -330,65 +352,64 @@ unique_ptr<SecretChatActor::Context> SecretChatsManager::make_secret_chat_contex
       }
     }
 
-    bool get_config_option_boolean(const string &name) const override {
-      return G()->shared_config().get_option_boolean(name);
+    bool get_config_option_boolean(const string &name) const final {
+      return G()->get_option_boolean(name);
     }
 
-    int32 unix_time() override {
+    int32 unix_time() final {
       return G()->unix_time();
     }
 
-    bool close_flag() override {
+    bool close_flag() final {
       return G()->close_flag();
     }
 
     void on_update_secret_chat(int64 access_hash, UserId user_id, SecretChatState state, bool is_outbound, int32 ttl,
-                               int32 date, string key_hash, int32 layer, FolderId initial_folder_id) override {
+                               int32 date, string key_hash, int32 layer, FolderId initial_folder_id) final {
       send_closure(G()->contacts_manager(), &ContactsManager::on_update_secret_chat, secret_chat_id_, access_hash,
                    user_id, state, is_outbound, ttl, date, key_hash, layer, initial_folder_id);
     }
 
-    void on_inbound_message(UserId user_id, MessageId message_id, int32 date,
-                            tl_object_ptr<telegram_api::encryptedFile> file,
-                            tl_object_ptr<secret_api::decryptedMessage> message, Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::on_get_secret_message, secret_chat_id_, user_id,
-                   message_id, date, std::move(file), std::move(message), std::move(promise));
+    void on_inbound_message(UserId user_id, MessageId message_id, int32 date, unique_ptr<EncryptedFile> file,
+                            tl_object_ptr<secret_api::decryptedMessage> message, Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::on_get_secret_message, secret_chat_id_, user_id,
+                         message_id, date, std::move(file), std::move(message), std::move(promise));
     }
 
-    void on_send_message_error(int64 random_id, Status error, Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::on_send_secret_message_error, random_id, std::move(error),
-                   std::move(promise));
+    void on_send_message_error(int64 random_id, Status error, Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::on_send_secret_message_error, random_id,
+                         std::move(error), std::move(promise));
     }
 
-    void on_send_message_ack(int64 random_id) override {
-      send_closure(G()->messages_manager(), &MessagesManager::on_send_message_get_quick_ack, random_id);
+    void on_send_message_ack(int64 random_id) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::on_send_message_get_quick_ack, random_id);
     }
-    void on_send_message_ok(int64 random_id, MessageId message_id, int32 date,
-                            tl_object_ptr<telegram_api::EncryptedFile> file, Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::on_send_secret_message_success, random_id, message_id,
-                   date, std::move(file), std::move(promise));
+    void on_send_message_ok(int64 random_id, MessageId message_id, int32 date, unique_ptr<EncryptedFile> file,
+                            Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::on_send_secret_message_success, random_id,
+                         message_id, date, std::move(file), std::move(promise));
     }
-    void on_delete_messages(std::vector<int64> random_ids, Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::delete_secret_messages, secret_chat_id_,
-                   std::move(random_ids), std::move(promise));
+    void on_delete_messages(std::vector<int64> random_ids, Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::delete_secret_messages, secret_chat_id_,
+                         std::move(random_ids), std::move(promise));
     }
-    void on_flush_history(MessageId message_id, Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::delete_secret_chat_history, secret_chat_id_, message_id,
-                   std::move(promise));
+    void on_flush_history(bool remove_from_dialog_list, MessageId message_id, Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::delete_secret_chat_history, secret_chat_id_,
+                         remove_from_dialog_list, message_id, std::move(promise));
     }
-    void on_read_message(int64 random_id, Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::open_secret_message, secret_chat_id_, random_id,
-                   std::move(promise));
+    void on_read_message(int64 random_id, Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::open_secret_message, secret_chat_id_, random_id,
+                         std::move(promise));
     }
     void on_screenshot_taken(UserId user_id, MessageId message_id, int32 date, int64 random_id,
-                             Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::on_secret_chat_screenshot_taken, secret_chat_id_, user_id,
-                   message_id, date, random_id, std::move(promise));
+                             Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::on_secret_chat_screenshot_taken, secret_chat_id_,
+                         user_id, message_id, date, random_id, std::move(promise));
     }
     void on_set_ttl(UserId user_id, MessageId message_id, int32 date, int32 ttl, int64 random_id,
-                    Promise<> promise) override {
-      send_closure(G()->messages_manager(), &MessagesManager::on_secret_chat_ttl_changed, secret_chat_id_, user_id,
-                   message_id, date, ttl, random_id, std::move(promise));
+                    Promise<> promise) final {
+      send_closure_later(G()->messages_manager(), &MessagesManager::on_secret_chat_ttl_changed, secret_chat_id_,
+                         user_id, message_id, date, ttl, random_id, std::move(promise));
     }
 
    private:
@@ -413,19 +434,14 @@ ActorId<SecretChatActor> SecretChatsManager::create_chat_actor_impl(int32 id, bo
     if (binlog_replay_finish_flag_) {
       send_closure(it_flag.first->second, &SecretChatActor::binlog_replay_finish);
     }
-    return it_flag.first->second.get();
-  } else {
-    return it_flag.first->second.get();
   }
+  return it_flag.first->second.get();
 }
 
 void SecretChatsManager::hangup() {
   close_flag_ = true;
-  if (dummy_mode_) {
-    return stop();
-  }
   for (auto &it : id_to_actor_) {
-    LOG(INFO) << "Ask close SecretChatActor " << tag("id", it.first);
+    LOG(INFO) << "Ask to close SecretChatActor " << tag("id", it.first);
     it.second.reset();
   }
   if (id_to_actor_.empty()) {
@@ -434,16 +450,13 @@ void SecretChatsManager::hangup() {
 }
 
 void SecretChatsManager::hangup_shared() {
-  CHECK(!dummy_mode_);
+  CHECK(use_secret_chats_);
   auto token = get_link_token();
   auto it = id_to_actor_.find(static_cast<int32>(token));
-  if (it != id_to_actor_.end()) {
-    LOG(INFO) << "Close SecretChatActor " << tag("id", it->first);
-    it->second.release();
-    id_to_actor_.erase(it);
-  } else {
-    LOG(FATAL) << "Unknown SecretChatActor hangup " << tag("id", static_cast<int32>(token));
-  }
+  CHECK(it != id_to_actor_.end());
+  LOG(INFO) << "Close SecretChatActor " << tag("id", it->first);
+  it->second.release();
+  id_to_actor_.erase(it);
   if (close_flag_ && id_to_actor_.empty()) {
     stop();
   }
@@ -454,16 +467,17 @@ void SecretChatsManager::timeout_expired() {
 }
 
 void SecretChatsManager::flush_pending_chat_updates() {
-  if (close_flag_ || dummy_mode_) {
+  if (close_flag_ || !use_secret_chats_) {
     return;
   }
   auto it = pending_chat_updates_.begin();
-  while (it != pending_chat_updates_.end() && (it->first.is_in_past() || is_online_)) {
-    do_update_chat(std::move(it->second));
+  while (it != pending_chat_updates_.end() &&
+         (is_online_ ? it->online_process_time_.is_in_past() : it->offline_process_time_.is_in_past())) {
+    do_update_chat(std::move(it->update_));
     ++it;
   }
   if (it != pending_chat_updates_.end()) {
-    set_timeout_at(it->first.at());
+    set_timeout_at(is_online_ ? it->online_process_time_.at() : it->offline_process_time_.at());
   }
   pending_chat_updates_.erase(pending_chat_updates_.begin(), it);
 }

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -15,8 +15,6 @@
 #include <set>
 #include <utility>
 
-REGISTER_TESTS(heap)
-
 TEST(Heap, sort_random_perm) {
   int n = 1000000;
 
@@ -25,7 +23,7 @@ TEST(Heap, sort_random_perm) {
     v[i] = i;
   }
   td::Random::Xorshift128plus rnd(123);
-  td::random_shuffle(td::as_mutable_span(v), rnd);
+  td::rand_shuffle(td::as_mutable_span(v), rnd);
   td::vector<td::HeapNode> nodes(n);
   td::KHeap<int> kheap;
   for (int i = 0; i < n; i++) {
@@ -35,7 +33,7 @@ TEST(Heap, sort_random_perm) {
     ASSERT_EQ(i, kheap.top_key());
     kheap.pop();
   }
-};
+}
 
 class CheckedHeap {
  public:
@@ -48,10 +46,12 @@ class CheckedHeap {
       nodes[i].value = i;
     }
   }
+
   static void xx(int key, const td::HeapNode *heap_node) {
     const Node *node = static_cast<const Node *>(heap_node);
     std::fprintf(stderr, "(%d;%d)", node->key, node->value);
   }
+
   void check() const {
     for (auto p : set_heap) {
       std::fprintf(stderr, "(%d;%d)", p.first, p.second);
@@ -61,13 +61,16 @@ class CheckedHeap {
     std::fprintf(stderr, "\n");
     kheap.check();
   }
+
   int random_id() const {
     CHECK(!empty());
     return ids[td::Random::fast(0, static_cast<int>(ids.size() - 1))];
   }
+
   std::size_t size() const {
     return ids.size();
   }
+
   bool empty() const {
     return ids.empty();
   }
@@ -79,8 +82,8 @@ class CheckedHeap {
     ASSERT_EQ(res, kheap.top_key());
     return res;
   }
+
   int insert(int key) {
-    // std::fprintf(stderr, "insert %d\n", key);
     int id;
     if (free_ids.empty()) {
       UNREACHABLE();
@@ -98,15 +101,15 @@ class CheckedHeap {
     set_heap.emplace(key, id);
     return id;
   }
+
   void fix_key(int new_key, int id) {
-    // std::fprintf(stderr, "fix key %d %d (old_key = %d)\n", new_key, id, nodes[id].key);
     set_heap.erase(std::make_pair(nodes[id].key, id));
     nodes[id].key = new_key;
     kheap.fix(new_key, &nodes[id]);
     set_heap.emplace(new_key, id);
   }
+
   void erase(int id) {
-    // std::fprintf(stderr, "erase %d\n", id);
     int pos = rev_ids[id];
     CHECK(pos != -1);
     ids[pos] = ids.back();
@@ -118,8 +121,8 @@ class CheckedHeap {
     kheap.erase(&nodes[id]);
     set_heap.erase(std::make_pair(nodes[id].key, id));
   }
+
   void pop() {
-    // std::fprintf(stderr, "pop\n");
     CHECK(!empty());
     Node *node = static_cast<Node *>(kheap.pop());
     int id = node->value;
@@ -137,7 +140,7 @@ class CheckedHeap {
   }
 
  private:
-  struct Node : public td::HeapNode {
+  struct Node final : public td::HeapNode {
     Node() = default;
     Node(int key, int value) : key(key), value(value) {
     }

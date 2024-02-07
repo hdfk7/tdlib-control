@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -18,24 +18,24 @@
 #include <utility>
 
 struct ListData {
-  td::MovableValue<td::uint64> value;
-  td::MovableValue<bool> in_list;
+  td::MovableValue<td::uint64> value_;
+  td::MovableValue<bool> in_list_;
 
   ListData() = default;
-  ListData(td::uint64 value, bool in_list) : value(value), in_list(in_list) {
+  ListData(td::uint64 value, bool in_list) : value_(value), in_list_(in_list) {
   }
 };
 
-struct Node : public td::ListNode {
+struct Node final : public td::ListNode {
   Node() = default;
-  explicit Node(ListData data) : data(std::move(data)) {
+  explicit Node(ListData data) : data_(std::move(data)) {
   }
 
-  ListData data;
+  ListData data_;
 };
 
 static ListData &get_data(Node &node) {
-  return node.data;
+  return node.data_;
 }
 
 static ListData &get_data(td::TsListNode<ListData> &node) {
@@ -63,7 +63,7 @@ static void do_run_list_test(ListRootT &root, std::atomic<td::uint64> &id) {
     if (nodes.size() >= 20) {
       return;
     }
-    nodes.emplace_back(NodeT({next_id(), false}));
+    nodes.push_back(NodeT({next_id(), false}));
   };
   auto pop_node = [&] {
     if (nodes.empty()) {
@@ -91,7 +91,7 @@ static void do_run_list_test(ListRootT &root, std::atomic<td::uint64> &id) {
     }
     auto i = random_node_index();
     nodes[i].remove();
-    get_data(nodes[i]).in_list = false;
+    get_data(nodes[i]).in_list_ = false;
   };
   auto swap_nodes = [&] {
     if (nodes.empty()) {
@@ -110,24 +110,25 @@ static void do_run_list_test(ListRootT &root, std::atomic<td::uint64> &id) {
     nodes[i] = std::move(nodes[j]);
   };
   auto validate = [&] {
-    std::multiset<td::uint64> in_list, not_in_list;
+    std::multiset<td::uint64> in_list;
+    std::multiset<td::uint64> not_in_list;
     for (auto &node : nodes) {
-      if (get_data(node).in_list.get()) {
-        in_list.insert(get_data(node).value.get());
+      if (get_data(node).in_list_.get()) {
+        in_list.insert(get_data(node).value_.get());
       } else {
-        not_in_list.insert(get_data(node).value.get());
+        not_in_list.insert(get_data(node).value_.get());
       }
     }
     auto guard = lock(root);
     for (auto *begin = root.begin(), *end = root.end(); begin != end; begin = begin->get_next()) {
       auto &data = get_data(*static_cast<NodeT *>(begin));
-      CHECK(data.in_list.get());
-      CHECK(data.value.get() != 0);
-      auto it = in_list.find(data.value.get());
+      CHECK(data.in_list_.get());
+      CHECK(data.value_.get() != 0);
+      auto it = in_list.find(data.value_.get());
       if (it != in_list.end()) {
         in_list.erase(it);
       } else {
-        ASSERT_EQ(0u, not_in_list.count(data.value.get()));
+        ASSERT_EQ(0u, not_in_list.count(data.value_.get()));
       }
     }
     ASSERT_EQ(0u, in_list.size());
@@ -155,6 +156,7 @@ TEST(Misc, TsList) {
   }
 }
 
+#if !TD_THREAD_UNSUPPORTED
 TEST(Misc, TsListConcurrent) {
   td::TsList<ListData> root;
   td::vector<td::thread> threads;
@@ -164,3 +166,4 @@ TEST(Misc, TsListConcurrent) {
         [&] { do_run_list_test<td::TsListNode<ListData>, td::TsList<ListData>, td::TsListNode<ListData>>(root, id); });
   }
 }
+#endif

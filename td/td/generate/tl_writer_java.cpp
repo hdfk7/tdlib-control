@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -190,15 +190,37 @@ std::string TD_TL_writer_java::gen_int_const(const tl::tl_tree *tree_c,
   return std::string();
 }
 
-std::string TD_TL_writer_java::gen_output_begin() const {
+std::string TD_TL_writer_java::gen_output_begin(const std::string &additional_imports) const {
   return "package " + package_name +
          ";\n\n"
          "public class " +
          tl_name + " {\n";
 }
 
+std::string TD_TL_writer_java::gen_output_begin_once() const {
+  return "    static {\n"
+         "        try {\n"
+         "            System.loadLibrary(\"tdjni\");\n"
+         "        } catch (UnsatisfiedLinkError e) {\n"
+         "            e.printStackTrace();\n"
+         "        }\n"
+         "    }\n\n"
+         "    private " +
+         tl_name +
+         "() {\n"
+         "    }\n\n";
+}
+
 std::string TD_TL_writer_java::gen_output_end() const {
   return "}\n";
+}
+
+std::string TD_TL_writer_java::gen_import_declaration(const std::string &name, bool is_system) const {
+  return "import " + name + ";\n";
+}
+
+std::string TD_TL_writer_java::gen_package_suffix() const {
+  return "";
 }
 
 std::string TD_TL_writer_java::gen_forward_class_declaration(const std::string &class_name, bool is_proxy) const {
@@ -206,14 +228,31 @@ std::string TD_TL_writer_java::gen_forward_class_declaration(const std::string &
 }
 
 std::string TD_TL_writer_java::gen_class_begin(const std::string &class_name, const std::string &base_class_name,
-                                               bool is_proxy) const {
+                                               bool is_proxy, const tl::tl_tree *result_tl) const {
   std::string full_class_name = "static class " + class_name;
+  if (class_name == "Function") {
+    full_class_name += "<R extends " + gen_base_tl_class_name() + ">";
+  }
   if (class_name != gen_base_tl_class_name()) {
     full_class_name += " extends " + base_class_name;
   }
+  if (result_tl != nullptr && base_class_name == "Function") {
+    assert(result_tl->get_type() == tl::NODE_TYPE_TYPE);
+    const tl::tl_tree_type *result_type = static_cast<const tl::tl_tree_type *>(result_tl);
+    std::string fetched_type = gen_type_name(result_type);
+
+    if (!fetched_type.empty() && fetched_type[fetched_type.size() - 1] == ' ') {
+      fetched_type.pop_back();
+    }
+
+    full_class_name += "<" + fetched_type + ">";
+  }
   std::string result = "    public " + std::string(is_proxy ? "abstract " : "") + full_class_name + " {\n";
+  if (is_proxy) {
+    result += "        public " + class_name + "() {\n        }\n";
+  }
   if (class_name == gen_base_tl_class_name() || class_name == gen_base_function_class_name()) {
-    result += "        public native String toString();\n";
+    result += "\n        public native String toString();\n";
   }
 
   return result;

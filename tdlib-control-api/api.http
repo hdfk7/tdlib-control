@@ -1,20 +1,21 @@
-GET http://127.0.0.1:8080/push/phone/+8619915643491
+### 登陆
+GET http://127.0.0.1:8080/push/phone/+8618683213323
 Accept: */*
 Cache-Control: no-cache
 
-###
-GET http://127.0.0.1:8080/push/code/+8619915643491/96276
+### 校验验证码
+GET http://127.0.0.1:8080/push/code/+8618683213323/31808
 Accept: */*
 Cache-Control: no-cache
 
-###
-POST http://127.0.0.1:8080/push/command/+8619915643491
+### 下发指令
+POST http://127.0.0.1:8080/push/command/+8618683213323
 Content-Type: application/json
 
 //模糊搜索聊天 Javae
 //获取会话信息 -1001056982813
 //获取群成员资料 1056982813
 //查询联系人资料 684762393
-gcs
+获取联系人列表
 
 ###

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -10,10 +10,10 @@
 
 namespace td {
 
-DialogLocation::DialogLocation(telegram_api::object_ptr<telegram_api::ChannelLocation> &&channel_location_ptr) {
+DialogLocation::DialogLocation(Td *td, telegram_api::object_ptr<telegram_api::ChannelLocation> &&channel_location_ptr) {
   if (channel_location_ptr != nullptr && channel_location_ptr->get_id() == telegram_api::channelLocation::ID) {
     auto channel_location = static_cast<telegram_api::channelLocation *>(channel_location_ptr.get());
-    location_ = Location(channel_location->geo_point_);
+    location_ = Location(td, channel_location->geo_point_);
     address_ = std::move(channel_location->address_);
   }
 }

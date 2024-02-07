@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -24,10 +24,10 @@ int pq_factorize(Slice pq_str, string *p_str, string *q_str);
 class AesState {
  public:
   AesState();
-  AesState(const AesState &from) = delete;
-  AesState &operator=(const AesState &from) = delete;
-  AesState(AesState &&from);
-  AesState &operator=(AesState &&from);
+  AesState(const AesState &) = delete;
+  AesState &operator=(const AesState &) = delete;
+  AesState(AesState &&from) noexcept;
+  AesState &operator=(AesState &&from) noexcept;
   ~AesState();
 
   void init(Slice key, bool encrypt);
@@ -49,10 +49,10 @@ class AesIgeStateImpl;
 class AesIgeState {
  public:
   AesIgeState();
-  AesIgeState(const AesIgeState &from) = delete;
-  AesIgeState &operator=(const AesIgeState &from) = delete;
-  AesIgeState(AesIgeState &&from);
-  AesIgeState &operator=(AesIgeState &&from);
+  AesIgeState(const AesIgeState &) = delete;
+  AesIgeState &operator=(const AesIgeState &) = delete;
+  AesIgeState(AesIgeState &&from) noexcept;
+  AesIgeState &operator=(AesIgeState &&from) noexcept;
   ~AesIgeState();
 
   void init(Slice key, Slice iv, bool encrypt);
@@ -71,10 +71,10 @@ void aes_cbc_decrypt(Slice aes_key, MutableSlice aes_iv, Slice from, MutableSlic
 class AesCtrState {
  public:
   AesCtrState();
-  AesCtrState(const AesCtrState &from) = delete;
-  AesCtrState &operator=(const AesCtrState &from) = delete;
-  AesCtrState(AesCtrState &&from);
-  AesCtrState &operator=(AesCtrState &&from);
+  AesCtrState(const AesCtrState &) = delete;
+  AesCtrState &operator=(const AesCtrState &) = delete;
+  AesCtrState(AesCtrState &&from) noexcept;
+  AesCtrState &operator=(AesCtrState &&from) noexcept;
   ~AesCtrState();
 
   void init(Slice key, Slice iv);
@@ -91,10 +91,10 @@ class AesCtrState {
 class AesCbcState {
  public:
   AesCbcState(Slice key256, Slice iv128);
-  AesCbcState(const AesCbcState &from) = delete;
-  AesCbcState &operator=(const AesCbcState &from) = delete;
-  AesCbcState(AesCbcState &&from);
-  AesCbcState &operator=(AesCbcState &&from);
+  AesCbcState(const AesCbcState &) = delete;
+  AesCbcState &operator=(const AesCbcState &) = delete;
+  AesCbcState(AesCbcState &&from) noexcept;
+  AesCbcState &operator=(AesCbcState &&from) noexcept;
   ~AesCbcState();
 
   void encrypt(Slice from, MutableSlice to);
@@ -122,6 +122,8 @@ void sha256(Slice data, MutableSlice output);
 
 void sha512(Slice data, MutableSlice output);
 
+string sha1(Slice data) TD_WARN_UNUSED_RESULT;
+
 string sha256(Slice data) TD_WARN_UNUSED_RESULT;
 
 string sha512(Slice data) TD_WARN_UNUSED_RESULT;
@@ -129,17 +131,17 @@ string sha512(Slice data) TD_WARN_UNUSED_RESULT;
 class Sha256State {
  public:
   Sha256State();
-  Sha256State(const Sha256State &other) = delete;
-  Sha256State &operator=(const Sha256State &other) = delete;
-  Sha256State(Sha256State &&other);
-  Sha256State &operator=(Sha256State &&other);
+  Sha256State(const Sha256State &) = delete;
+  Sha256State &operator=(const Sha256State &) = delete;
+  Sha256State(Sha256State &&other) noexcept;
+  Sha256State &operator=(Sha256State &&other) noexcept;
   ~Sha256State();
 
   void init();
 
   void feed(Slice data);
 
-  void extract(MutableSlice dest, bool destroy = false);
+  void extract(MutableSlice output, bool destroy = false);
 
  private:
   class Impl;

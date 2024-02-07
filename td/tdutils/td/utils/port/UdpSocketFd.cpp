@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -13,11 +13,12 @@
 #include "td/utils/port/detail/skip_eintr.h"
 #include "td/utils/port/PollFlags.h"
 #include "td/utils/port/SocketFd.h"
+#include "td/utils/SliceBuilder.h"
 #include "td/utils/VectorQueue.h"
 
 #if TD_PORT_WINDOWS
 #include "td/utils/port/detail/Iocp.h"
-#include "td/utils/SpinLock.h"
+#include "td/utils/port/Mutex.h"
 #endif
 
 #if TD_PORT_POSIX
@@ -34,7 +35,7 @@
 #if TD_LINUX
 #include <linux/errqueue.h>
 #endif
-#endif  // TD_PORT_POSIX
+#endif
 
 #include <array>
 #include <atomic>
@@ -58,7 +59,7 @@ class UdpSocketReceiveHelper {
     message_header.dwFlags = 0;
   }
 
-  void from_native(WSAMSG &message_header, size_t message_size, UdpMessage &message) {
+  static void from_native(WSAMSG &message_header, size_t message_size, UdpMessage &message) {
     message.address.init_sockaddr(reinterpret_cast<sockaddr *>(message_header.name), message_header.namelen).ignore();
     message.error = Status::OK();
 
@@ -78,6 +79,7 @@ class UdpSocketReceiveHelper {
   sockaddr_storage addr_;
   WSABUF buf_;
 };
+
 class UdpSocketSendHelper {
  public:
   void to_native(const UdpMessage &message, WSAMSG &message_header) {
@@ -97,7 +99,7 @@ class UdpSocketSendHelper {
   WSABUF buf_;
 };
 
-class UdpSocketFdImpl : private Iocp::Callback {
+class UdpSocketFdImpl final : private Iocp::Callback {
  public:
   explicit UdpSocketFdImpl(NativeFd fd) : info_(std::move(fd)) {
     get_poll_info().add_flags(PollFlags::Write());
@@ -152,7 +154,7 @@ class UdpSocketFdImpl : private Iocp::Callback {
 
  private:
   PollableFdInfo info_;
-  SpinLock lock_;
+  Mutex lock_;
 
   std::atomic<int> refcnt_{1};
   bool is_connected_{false};
@@ -239,7 +241,7 @@ class UdpSocketFdImpl : private Iocp::Callback {
     }
   }
 
-  void on_iocp(Result<size_t> r_size, WSAOVERLAPPED *overlapped) override {
+  void on_iocp(Result<size_t> r_size, WSAOVERLAPPED *overlapped) final {
     // called from other thread
     if (dec_refcnt() || close_flag_) {
       VLOG(fd) << "Ignore IOCP (UDP socket is closing)";
@@ -294,7 +296,7 @@ class UdpSocketFdImpl : private Iocp::Callback {
     VLOG(fd) << get_native_fd() << " on receive " << size;
     CHECK(is_receive_active_);
     is_receive_active_ = false;
-    receive_helper_.from_native(receive_message_, size, to_receive_);
+    UdpSocketReceiveHelper::from_native(receive_message_, size, to_receive_);
     receive_buffer_.confirm_read((to_receive_.data.size() + 7) & ~7);
     {
       auto lock = lock_.lock();
@@ -386,7 +388,7 @@ class UdpSocketReceiveHelper {
     message_header.msg_flags = 0;
   }
 
-  void from_native(msghdr &message_header, size_t message_size, UdpSocketFd::InboundMessage &message) {
+  static void from_native(msghdr &message_header, size_t message_size, UdpSocketFd::InboundMessage &message) {
 #if TD_LINUX
     cmsghdr *cmsg;
     sock_extended_err *ee = nullptr;
@@ -501,7 +503,7 @@ class UdpSocketFdImpl {
     auto recvmsg_res = detail::skip_eintr([&] { return recvmsg(native_fd, &message_header, flags); });
     auto recvmsg_errno = errno;
     if (recvmsg_res >= 0) {
-      helper.from_native(message_header, recvmsg_res, message);
+      UdpSocketReceiveHelper::from_native(message_header, recvmsg_res, message);
       is_received = true;
       return Status::OK();
     }
@@ -572,7 +574,7 @@ class UdpSocketFdImpl {
 
     auto error = Status::PosixError(sendmsg_errno, PSLICE() << "Send from " << get_native_fd() << " has failed");
     switch (sendmsg_errno) {
-      // Still may send some other packets, but there is no point to resend this particular message
+      // We still may send some other packets, but there is no point to resend this particular message
       case EACCES:
       case EMSGSIZE:
       case EPERM:
@@ -581,7 +583,7 @@ class UdpSocketFdImpl {
         is_sent = true;
         return error;
 
-      // Some general problems, which may be fixed in future
+      // Some general issues, which may be fixed in the future
       case ENOMEM:
       case EDQUOT:
       case EFBIG:
@@ -598,12 +600,12 @@ class UdpSocketFdImpl {
 
       case EBADF:         // impossible
       case ENOTSOCK:      // impossible
-      case EPIPE:         // impossible for udp
-      case ECONNRESET:    // impossible for udp
+      case EPIPE:         // impossible for UDP
+      case ECONNRESET:    // impossible for UDP
       case EDESTADDRREQ:  // we checked that address is valid
       case ENOTCONN:      // we checked that address is valid
       case EINTR:         // we already skipped all EINTR
-      case EISCONN:       // impossible for udp socket
+      case EISCONN:       // impossible for UDP socket
       case EOPNOTSUPP:
       case ENOTDIR:
       case EFAULT:
@@ -718,7 +720,7 @@ class UdpSocketFdImpl {
     if (recvmmsg_res >= 0) {
       cnt = narrow_cast<size_t>(recvmmsg_res);
       for (size_t i = 0; i < cnt; i++) {
-        helpers[i].from_native(headers[i].msg_hdr, headers[i].msg_len, messages[i]);
+        UdpSocketReceiveHelper::from_native(headers[i].msg_hdr, headers[i].msg_len, messages[i]);
       }
       return Status::OK();
     }
@@ -737,8 +739,8 @@ void UdpSocketFdImplDeleter::operator()(UdpSocketFdImpl *impl) {
 }  // namespace detail
 
 UdpSocketFd::UdpSocketFd() = default;
-UdpSocketFd::UdpSocketFd(UdpSocketFd &&) = default;
-UdpSocketFd &UdpSocketFd::operator=(UdpSocketFd &&) = default;
+UdpSocketFd::UdpSocketFd(UdpSocketFd &&) noexcept = default;
+UdpSocketFd &UdpSocketFd::operator=(UdpSocketFd &&) noexcept = default;
 UdpSocketFd::~UdpSocketFd() = default;
 PollableFdInfo &UdpSocketFd::get_poll_info() {
   return impl_->get_poll_info();
@@ -788,41 +790,49 @@ const NativeFd &UdpSocketFd::get_native_fd() const {
 }
 
 #if TD_PORT_POSIX
-static Result<uint32> maximize_buffer(int socket_fd, int optname, uint32 max) {
+static Result<uint32> maximize_buffer(int socket_fd, int optname, uint32 max_size) {
+  if (setsockopt(socket_fd, SOL_SOCKET, optname, &max_size, sizeof(max_size)) == 0) {
+    // fast path
+    return max_size;
+  }
+
   /* Start with the default size. */
-  uint32 old_size;
+  uint32 old_size = 0;
   socklen_t intsize = sizeof(old_size);
   if (getsockopt(socket_fd, SOL_SOCKET, optname, &old_size, &intsize)) {
     return OS_ERROR("getsockopt() failed");
   }
+#if TD_LINUX
+  old_size /= 2;
+#endif
 
   /* Binary-search for the real maximum. */
-  uint32 last_good = old_size;
-  uint32 min = old_size;
-  while (min <= max) {
-    uint32 avg = min + (max - min) / 2;
-    if (setsockopt(socket_fd, SOL_SOCKET, optname, &avg, intsize) == 0) {
-      last_good = avg;
-      min = avg + 1;
+  uint32 last_good_size = old_size;
+  uint32 min_size = old_size;
+  while (min_size <= max_size) {
+    uint32 avg_size = min_size + (max_size - min_size) / 2;
+    if (setsockopt(socket_fd, SOL_SOCKET, optname, &avg_size, sizeof(avg_size)) == 0) {
+      last_good_size = avg_size;
+      min_size = avg_size + 1;
     } else {
-      max = avg - 1;
+      max_size = avg_size - 1;
     }
   }
-  return last_good;
+  return last_good_size;
 }
 
-Result<uint32> UdpSocketFd::maximize_snd_buffer(uint32 max) {
-  return maximize_buffer(get_native_fd().fd(), SO_SNDBUF, max == 0 ? DEFAULT_UDP_MAX_SND_BUFFER_SIZE : max);
+Result<uint32> UdpSocketFd::maximize_snd_buffer(uint32 max_size) {
+  return maximize_buffer(get_native_fd().fd(), SO_SNDBUF, max_size == 0 ? DEFAULT_UDP_MAX_SND_BUFFER_SIZE : max_size);
 }
 
-Result<uint32> UdpSocketFd::maximize_rcv_buffer(uint32 max) {
-  return maximize_buffer(get_native_fd().fd(), SO_RCVBUF, max == 0 ? DEFAULT_UDP_MAX_RCV_BUFFER_SIZE : max);
+Result<uint32> UdpSocketFd::maximize_rcv_buffer(uint32 max_size) {
+  return maximize_buffer(get_native_fd().fd(), SO_RCVBUF, max_size == 0 ? DEFAULT_UDP_MAX_RCV_BUFFER_SIZE : max_size);
 }
 #else
-Result<uint32> UdpSocketFd::maximize_snd_buffer(uint32 max) {
+Result<uint32> UdpSocketFd::maximize_snd_buffer(uint32 max_size) {
   return 0;
 }
-Result<uint32> UdpSocketFd::maximize_rcv_buffer(uint32 max) {
+Result<uint32> UdpSocketFd::maximize_rcv_buffer(uint32 max_size) {
   return 0;
 }
 #endif

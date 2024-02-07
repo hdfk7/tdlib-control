@@ -1,14 +1,16 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/InputMessageText.h"
 
-#include "td/telegram/ConfigShared.h"
-#include "td/telegram/Global.h"
+#include "td/telegram/ContactsManager.h"
+#include "td/telegram/Dependencies.h"
 #include "td/telegram/MessageEntity.h"
+#include "td/telegram/misc.h"
+#include "td/telegram/Td.h"
 
 #include "td/utils/common.h"
 
@@ -23,40 +25,80 @@ bool operator!=(const InputMessageText &lhs, const InputMessageText &rhs) {
   return !(lhs == rhs);
 }
 
-Result<InputMessageText> process_input_message_text(const ContactsManager *contacts_manager, DialogId dialog_id,
+Result<InputMessageText> process_input_message_text(const Td *td, DialogId dialog_id,
                                                     tl_object_ptr<td_api::InputMessageContent> &&input_message_content,
                                                     bool is_bot, bool for_draft) {
   CHECK(input_message_content != nullptr);
   CHECK(input_message_content->get_id() == td_api::inputMessageText::ID);
   auto input_message_text = static_cast<td_api::inputMessageText *>(input_message_content.get());
-  if (input_message_text->text_ == nullptr) {
-    if (for_draft) {
-      return InputMessageText{FormattedText(), input_message_text->disable_web_page_preview_,
-                              input_message_text->clear_draft_};
+  string web_page_url;
+  bool disable_web_page_preview = false;
+  bool force_small_media = false;
+  bool force_large_media = false;
+  bool show_above_text = false;
+  if (input_message_text->link_preview_options_ != nullptr) {
+    auto options = std::move(input_message_text->link_preview_options_);
+    web_page_url = std::move(options->url_);
+    disable_web_page_preview = options->is_disabled_;
+    force_small_media = options->force_small_media_;
+    force_large_media = options->force_large_media_;
+    show_above_text = options->show_above_text_;
+
+    if (!clean_input_string(web_page_url)) {
+      return Status::Error(400, "Link preview URL must be encoded in UTF-8");
     }
 
-    return Status::Error(400, "Message text can't be empty");
+    if (disable_web_page_preview ||
+        (dialog_id.get_type() == DialogType::Channel &&
+         !td->contacts_manager_->get_channel_permissions(dialog_id.get_channel_id()).can_add_web_page_previews())) {
+      web_page_url.clear();
+    }
+    if (web_page_url.empty()) {
+      force_small_media = false;
+      force_large_media = false;
+    }
   }
-
-  TRY_RESULT(entities, get_message_entities(contacts_manager, std::move(input_message_text->text_->entities_)));
-  auto need_skip_commands = need_skip_bot_commands(contacts_manager, dialog_id, is_bot);
-  bool parse_markdown = G()->shared_config().get_option_boolean("always_parse_markdown");
-  TRY_STATUS(fix_formatted_text(input_message_text->text_->text_, entities, for_draft, parse_markdown,
-                                need_skip_commands, for_draft));
-  InputMessageText result{FormattedText{std::move(input_message_text->text_->text_), std::move(entities)},
-                          input_message_text->disable_web_page_preview_, input_message_text->clear_draft_};
-  if (G()->shared_config().get_option_boolean("always_parse_markdown")) {
-    result.text = parse_markdown_v3(std::move(result.text));
-    fix_formatted_text(result.text.text, result.text.entities, for_draft, false, need_skip_commands, for_draft)
-        .ensure();
+  TRY_RESULT(text, get_formatted_text(td, dialog_id, std::move(input_message_text->text_), is_bot,
+                                      for_draft || !web_page_url.empty(), for_draft, for_draft));
+  if (!disable_web_page_preview && web_page_url.empty() && dialog_id.get_type() == DialogType::SecretChat) {
+    web_page_url = get_first_url(text).str();
   }
-  return std::move(result);
+  return InputMessageText{
+      std::move(text),   std::move(web_page_url), disable_web_page_preview,        force_small_media,
+      force_large_media, show_above_text,         input_message_text->clear_draft_};
 }
 
-td_api::object_ptr<td_api::inputMessageText> get_input_message_text_object(const InputMessageText &input_message_text) {
-  return td_api::make_object<td_api::inputMessageText>(get_formatted_text_object(input_message_text.text),
-                                                       input_message_text.disable_web_page_preview,
-                                                       input_message_text.clear_draft);
+void InputMessageText::add_dependencies(Dependencies &dependencies) const {
+  add_formatted_text_dependencies(dependencies, &text);
+}
+
+telegram_api::object_ptr<telegram_api::InputMedia> InputMessageText::get_input_media_web_page() const {
+  if (web_page_url.empty()) {
+    return nullptr;
+  }
+  int32 flags = 0;
+  if (force_small_media) {
+    flags |= telegram_api::inputMediaWebPage::FORCE_SMALL_MEDIA_MASK;
+  }
+  if (force_large_media) {
+    flags |= telegram_api::inputMediaWebPage::FORCE_LARGE_MEDIA_MASK;
+  }
+  if (!text.text.empty()) {
+    flags |= telegram_api::inputMediaWebPage::OPTIONAL_MASK;
+  }
+  return telegram_api::make_object<telegram_api::inputMediaWebPage>(flags, false /*ignored*/, false /*ignored*/,
+                                                                    false /*ignored*/, web_page_url);
+}
+
+// used only for draft
+td_api::object_ptr<td_api::inputMessageText> InputMessageText::get_input_message_text_object() const {
+  td_api::object_ptr<td_api::linkPreviewOptions> options;
+  if (!web_page_url.empty() || disable_web_page_preview || force_small_media || force_large_media || show_above_text) {
+    options = td_api::make_object<td_api::linkPreviewOptions>(disable_web_page_preview, web_page_url, force_small_media,
+                                                              force_large_media, show_above_text);
+  }
+  return td_api::make_object<td_api::inputMessageText>(get_formatted_text_object(text, false, -1), std::move(options),
+                                                       clear_draft);
 }
 
 }  // namespace td

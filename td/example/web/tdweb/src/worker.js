@@ -65,7 +65,7 @@ async function loadTdlibWasm(onFS, wasmUrl) {
   console.log('loadTdlibWasm');
   const td_module = await import('./prebuilt/release/td_wasm.js');
   const createTdwebModule = td_module.default;
-  log.info('got td_wasm.js', td_module, createTdwebModule);
+  log.info('receive td_wasm.js', td_module, createTdwebModule);
   let td_wasm = td_wasm_release;
   if (wasmUrl) {
     td_wasm = wasmUrl;
@@ -73,6 +73,7 @@ async function loadTdlibWasm(onFS, wasmUrl) {
   let module = createTdwebModule({
     onRuntimeInitialized: () => {
       log.info('runtime intialized');
+      onFS(module.FS);
     },
     instantiateWasm: (imports, successCallback) => {
       log.info('start instantiateWasm', td_wasm, imports);
@@ -82,13 +83,11 @@ async function loadTdlibWasm(onFS, wasmUrl) {
       };
       instantiateAny(tdlibVersion, td_wasm, imports).then(next);
       return {};
-    },
-    ENVIROMENT: 'WORKER'
+    }
   });
-  onFS(module.FS); // hack
   log.info('Wait module');
   module = await module;
-  log.info('Got module', module);
+  log.info('Loaded module', module);
   //onFS(module.FS);
   return module;
 }
@@ -97,25 +96,24 @@ async function loadTdlibAsmjs(onFS) {
   console.log('loadTdlibAsmjs');
   const createTdwebModule = (await import('./prebuilt/release/td_asmjs.js'))
     .default;
-  console.log('got td_asm.js', createTdwebModule);
+  console.log('Loaded td_asm.js', createTdwebModule);
   const fromFile = 'td_asmjs.js.mem';
   const toFile = td_asmjs_mem_release;
   let module = createTdwebModule({
     onRuntimeInitialized: () => {
       console.log('runtime intialized');
+      onFS(module.FS);
     },
     locateFile: name => {
       if (name === fromFile) {
         return toFile;
       }
       return name;
-    },
-    ENVIROMENT: 'WORKER'
+    }
   });
-  onFS(module.FS); // hack
   log.info('Wait module');
   module = await module;
-  log.info('Got module', module);
+  log.info('Loaded module', module);
   //onFS(module.FS);
   return module;
 }
@@ -575,7 +573,7 @@ class TdClient {
         await localforage.setItem('hello', 'world');
         console.log('B');
         const x = await localforage.getItem('hello');
-        console.log('got ', x);
+        console.log('receive ', x);
         await localforage.clear();
         console.log('C');
       } catch (error) {
@@ -612,9 +610,13 @@ class TdClient {
 
     log.info('load TdModule');
     this.TdModule = await loadTdlib(mode, this.onFS, options.wasmUrl);
-    log.info('got TdModule');
+    log.info('loaded TdModule');
     this.td_functions = {
-      td_create: this.TdModule.cwrap('td_emscripten_create', 'number', []),
+      td_create: this.TdModule.cwrap(
+        'td_emscripten_create_client_id',
+        'number',
+        []
+      ),
       td_send: this.TdModule.cwrap('td_emscripten_send', null, [
         'number',
         'string'
@@ -679,7 +681,7 @@ class TdClient {
       options.logVerbosityLevel = 2;
     }
     this.td_functions.td_set_verbosity(options.logVerbosityLevel);
-    this.client = this.td_functions.td_create();
+    this.client_id = this.td_functions.td_create();
 
     this.savingFiles = new Map();
     this.send({
@@ -730,14 +732,14 @@ class TdClient {
 
   prepareQuery(query) {
     if (query['@type'] === 'setTdlibParameters') {
-      query.parameters.database_directory = this.tdfs.dbFileSystem.root;
-      query.parameters.files_directory = this.tdfs.inboundFileSystem.root;
+      query.database_directory = this.tdfs.dbFileSystem.root;
+      query.files_directory = this.tdfs.inboundFileSystem.root;
 
       const useDb = this.useDatabase;
-      query.parameters.use_file_database = useDb;
-      query.parameters.use_chat_info_database = useDb;
-      query.parameters.use_message_database = useDb;
-      query.parameters.use_secret_chats = useDb;
+      query.use_file_database = useDb;
+      query.use_chat_info_database = useDb;
+      query.use_message_database = useDb;
+      query.use_secret_chats = useDb;
     }
     if (query['@type'] === 'getLanguagePackString') {
       query.language_pack_database_path =
@@ -842,7 +844,7 @@ class TdClient {
       return;
     }
     query = this.prepareQuery(query);
-    this.td_functions.td_send(this.client, JSON.stringify(query));
+    this.td_functions.td_send(this.client_id, JSON.stringify(query));
     this.scheduleReceiveSoon();
   }
 

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -14,7 +14,7 @@
 #include "td/telegram/VideoNotesManager.h"
 #include "td/telegram/VideosManager.h"
 
-#include "td/utils/misc.h"
+#include "td/utils/algorithm.h"
 
 namespace td {
 
@@ -68,6 +68,10 @@ void Document::append_file_ids(const Td *td, vector<FileId> &file_ids) const {
   }();
   if (animated_thumbnail_file_id.is_valid()) {
     file_ids.push_back(animated_thumbnail_file_id);
+  }
+
+  if (type == Type::Audio) {
+    td->audios_manager_->append_audio_album_cover_file_ids(file_id, file_ids);
   }
 }
 

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -18,7 +18,7 @@ template <class StatT>
 class TimedStat {
  public:
   TimedStat(double duration, double now)
-      : duration_(duration), current_(), current_timestamp_(now), next_(), next_timestamp_(now) {
+      : duration_(duration), current_(), current_timestamp_(now - 1), next_(), next_timestamp_(now) {
   }
   TimedStat() : TimedStat(0, 0) {
   }
@@ -58,7 +58,7 @@ class TimedStat {
     }
     if (next_timestamp_ + 2 * duration_ < now) {
       current_ = StatT();
-      current_timestamp_ = now;
+      current_timestamp_ = now - duration_;
       next_ = StatT();
       next_timestamp_ = now;
     } else if (next_timestamp_ + duration_ < now) {
@@ -89,9 +89,9 @@ struct MinMaxStat {
 }  // namespace detail
 
 template <class T>
-using MinStat = detail::MinMaxStat<T, std::less<>>;
+using MinStat = detail::MinMaxStat<T, std::less<void>>;
 
 template <class T>
-using MaxStat = detail::MinMaxStat<T, std::greater<>>;
+using MaxStat = detail::MinMaxStat<T, std::greater<void>>;
 
 }  // namespace td

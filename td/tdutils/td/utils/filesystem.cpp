@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -7,12 +7,12 @@
 #include "td/utils/filesystem.h"
 
 #include "td/utils/buffer.h"
-#include "td/utils/logging.h"
 #include "td/utils/misc.h"
 #include "td/utils/PathView.h"
 #include "td/utils/port/FileFd.h"
 #include "td/utils/port/path.h"
 #include "td/utils/Slice.h"
+#include "td/utils/SliceBuilder.h"
 #include "td/utils/Status.h"
 #include "td/utils/unicode.h"
 #include "td/utils/utf8.h"
@@ -133,7 +133,7 @@ static string clean_filename_part(Slice name, int max_length) {
   int size = 0;
   for (auto *it = name.ubegin(); it != name.uend() && size < max_length;) {
     uint32 code;
-    it = next_utf8_unsafe(it, &code, "clean_filename_part");
+    it = next_utf8_unsafe(it, &code);
     if (!is_ok(code)) {
       if (prepare_search_character(code) == 0) {
         continue;
@@ -159,8 +159,8 @@ string clean_filename(CSlice name) {
   }
 
   PathView path_view(name);
-  auto filename = clean_filename_part(path_view.file_stem(), 60);
-  auto extension = clean_filename_part(path_view.extension(), 20);
+  auto filename = clean_filename_part(path_view.file_stem(), 64);
+  auto extension = clean_filename_part(path_view.extension(), 16);
   if (!extension.empty()) {
     if (filename.empty()) {
       filename = std::move(extension);

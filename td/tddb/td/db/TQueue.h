@@ -1,14 +1,13 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #pragma once
 
-#include "td/actor/PromiseFuture.h"
-
 #include "td/utils/common.h"
+#include "td/utils/Promise.h"
 #include "td/utils/Slice.h"
 #include "td/utils/Span.h"
 #include "td/utils/Status.h"
@@ -54,17 +53,17 @@ class TQueue {
 
   struct Event {
     EventId id;
+    int32 expires_at{0};
     Slice data;
     int64 extra{0};
-    int32 expires_at{0};
   };
 
   struct RawEvent {
     uint64 log_event_id{0};
     EventId event_id;
+    int32 expires_at{0};
     string data;
     int64 extra{0};
-    int32 expires_at{0};
   };
 
   using QueueId = int64;
@@ -84,6 +83,7 @@ class TQueue {
     virtual uint64 push(QueueId queue_id, const RawEvent &event) = 0;
     virtual void pop(uint64 log_event_id) = 0;
     virtual void close(Promise<> promise) = 0;
+    virtual void pop_batch(std::vector<uint64> log_event_ids);
   };
 
   static unique_ptr<TQueue> create();
@@ -105,6 +105,8 @@ class TQueue {
 
   virtual void forget(QueueId queue_id, EventId event_id) = 0;
 
+  virtual std::map<EventId, RawEvent> clear(QueueId queue_id, size_t keep_count) = 0;
+
   virtual EventId get_head(QueueId queue_id) const = 0;
   virtual EventId get_tail(QueueId queue_id) const = 0;
 
@@ -113,37 +115,39 @@ class TQueue {
 
   virtual size_t get_size(QueueId queue_id) const = 0;
 
-  virtual int64 run_gc(int32 unix_time_now) = 0;
+  // returns number of deleted events and whether garbage collection was completed
+  virtual std::pair<int64, bool> run_gc(int32 unix_time_now) = 0;
   virtual void close(Promise<> promise) = 0;
 };
 
-StringBuilder &operator<<(StringBuilder &string_builder, const TQueue::EventId id);
+StringBuilder &operator<<(StringBuilder &string_builder, TQueue::EventId id);
 
 struct BinlogEvent;
 
 template <class BinlogT>
-class TQueueBinlog : public TQueue::StorageCallback {
+class TQueueBinlog final : public TQueue::StorageCallback {
  public:
-  uint64 push(QueueId queue_id, const RawEvent &event) override;
-  void pop(uint64 log_event_id) override;
+  uint64 push(QueueId queue_id, const RawEvent &event) final;
+  void pop(uint64 log_event_id) final;
+  void pop_batch(std::vector<uint64> log_event_ids) final;
   Status replay(const BinlogEvent &binlog_event, TQueue &q) const TD_WARN_UNUSED_RESULT;
 
   void set_binlog(std::shared_ptr<BinlogT> binlog) {
     binlog_ = std::move(binlog);
   }
-  virtual void close(Promise<> promise) override;
+  void close(Promise<> promise) final;
 
  private:
   std::shared_ptr<BinlogT> binlog_;
   static constexpr int32 BINLOG_EVENT_TYPE = 2314;
 };
 
-class TQueueMemoryStorage : public TQueue::StorageCallback {
+class TQueueMemoryStorage final : public TQueue::StorageCallback {
  public:
-  uint64 push(QueueId queue_id, const RawEvent &event) override;
-  void pop(uint64 log_event_id) override;
+  uint64 push(QueueId queue_id, const RawEvent &event) final;
+  void pop(uint64 log_event_id) final;
   void replay(TQueue &q) const;
-  virtual void close(Promise<> promise) override;
+  void close(Promise<> promise) final;
 
  private:
   uint64 next_log_event_id_{1};

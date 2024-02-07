@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -31,6 +31,9 @@ class optional {
   }
 
   optional &operator=(const optional &other) {
+    if (this == &other) {
+      return *this;
+    }
     if (other) {
       impl_ = Result<T>(other.value());
     } else {
@@ -39,11 +42,11 @@ class optional {
     return *this;
   }
 
-  optional(optional &&other) = default;
-  optional &operator=(optional &&other) = default;
+  optional(optional &&) = default;
+  optional &operator=(optional &&) = default;
   ~optional() = default;
 
-  explicit operator bool() const {
+  explicit operator bool() const noexcept {
     return impl_.is_ok();
   }
   T &value() {
@@ -72,7 +75,7 @@ class optional {
   }
 
   template <class... ArgsT>
-  void emplace(ArgsT &&... args) {
+  void emplace(ArgsT &&...args) {
     impl_.emplace(std::forward<ArgsT>(args)...);
   }
 
@@ -86,8 +89,8 @@ struct optional<T, false> : optional<T, true> {
 
   using optional<T, true>::optional;
 
-  optional(const optional &other) = delete;
-  optional &operator=(const optional &other) = delete;
+  optional(const optional &) = delete;
+  optional &operator=(const optional &) = delete;
   optional(optional &&) = default;
   optional &operator=(optional &&) = default;
   ~optional() = default;

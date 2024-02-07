@@ -1,19 +1,17 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
 //
 #include "td/telegram/files/FileUploader.h"
 
-#include "td/telegram/telegram_api.h"
-
 #include "td/telegram/files/FileLoaderUtils.h"
-
 #include "td/telegram/Global.h"
 #include "td/telegram/net/DcId.h"
 #include "td/telegram/net/NetQueryDispatcher.h"
 #include "td/telegram/SecureStorage.h"
+#include "td/telegram/telegram_api.h"
 
 #include "td/utils/buffer.h"
 #include "td/utils/common.h"
@@ -40,7 +38,8 @@ FileUploader::FileUploader(const LocalFileLocation &local, const RemoteFileLocat
     iv_ = encryption_key_.mutable_iv();
     generate_iv_ = encryption_key_.iv_slice().str();
   }
-  if (remote_.type() == RemoteFileLocation::Type::Partial && encryption_key_.is_secure()) {
+  if (remote_.type() == RemoteFileLocation::Type::Partial && encryption_key_.is_secure() &&
+      remote_.partial().part_count_ != remote_.partial().ready_part_count_) {
     remote_ = RemoteFileLocation{};
   }
 }
@@ -82,7 +81,13 @@ Result<FileLoader::FileInfo> FileUploader::init() {
   }
   if (!ok.empty() && !ok[0]) {
     parts.clear();
+    part_size = 0;
+    remote_ = RemoteFileLocation();
+    file_id_ = Random::secure_int64();
+    big_flag_ = is_file_big(file_type_, expected_size_);
   }
+
+  LOG(DEBUG) << "Init file uploader for " << remote_ << " with offset = " << offset << " and part size = " << part_size;
   FileInfo res;
   res.size = local_size_;
   res.is_size_final = local_is_ready_;
@@ -134,7 +139,7 @@ Result<FileLoader::PrefixInfo> FileUploader::on_update_local_location(const Loca
   file_type_ = file_type;
 
   bool is_temp = false;
-  if (encryption_key_.is_secure() && local_is_ready) {
+  if (encryption_key_.is_secure() && local_is_ready && remote_.type() == RemoteFileLocation::Type::Empty) {
     TRY_RESULT(file_fd_path, open_temp_file(FileType::Temp));
     file_fd_path.first.close();
     auto new_path = std::move(file_fd_path.second);
@@ -184,7 +189,7 @@ Result<FileLoader::PrefixInfo> FileUploader::on_update_local_location(const Loca
   }
 
   local_size_ = local_size;
-  if (expected_size_ < local_size_) {
+  if (expected_size_ < local_size_ && (expected_size_ != (10 << 20) || local_size_ >= (30 << 20))) {
     expected_size_ = local_size_;
   }
   local_is_ready_ = local_is_ready;
@@ -224,12 +229,12 @@ Status FileUploader::generate_iv_map() {
   CHECK(!fd_.empty());
   for (; generate_offset_ + static_cast<int64>(part_size) < local_size_;
        generate_offset_ += static_cast<int64>(part_size)) {
-    TRY_RESULT(read_size, fd_.pread(bytes.as_slice(), generate_offset_));
+    TRY_RESULT(read_size, fd_.pread(bytes.as_mutable_slice(), generate_offset_));
     if (read_size != part_size) {
       return Status::Error("Failed to read file part (for iv_map)");
     }
-    aes_ige_encrypt(as_slice(encryption_key.key()), as_slice(encryption_key.mutable_iv()), bytes.as_slice(),
-                    bytes.as_slice());
+    aes_ige_encrypt(as_slice(encryption_key.key()), as_mutable_slice(encryption_key.mutable_iv()), bytes.as_slice(),
+                    bytes.as_mutable_slice());
     iv_map_.push_back(encryption_key.mutable_iv());
   }
   generate_iv_ = encryption_key.iv_slice().str();
@@ -239,10 +244,11 @@ Status FileUploader::generate_iv_map() {
 Status FileUploader::before_start_parts() {
   auto status = acquire_fd();
   if (status.is_error() && !local_is_ready_) {
-    return Status::Error(1, "Can't open temporary file");
+    return Status::Error(-1, "Can't open temporary file");
   }
   return status;
 }
+
 void FileUploader::after_start_parts() {
   try_release_fd();
 }
@@ -253,11 +259,12 @@ Result<std::pair<NetQueryPtr, bool>> FileUploader::start_part(Part part, int32 p
     padded_size = (padded_size + 15) & ~15;
   }
   BufferSlice bytes(padded_size);
-  TRY_RESULT(size, fd_.pread(bytes.as_slice().truncate(part.size), part.offset));
+  TRY_RESULT(size, fd_.pread(bytes.as_mutable_slice().truncate(part.size), part.offset));
   if (encryption_key_.is_secret()) {
-    Random::secure_bytes(bytes.as_slice().substr(part.size));
+    Random::secure_bytes(bytes.as_mutable_slice().substr(part.size));
     if (next_offset_ == part.offset) {
-      aes_ige_encrypt(as_slice(encryption_key_.key()), as_slice(iv_), bytes.as_slice(), bytes.as_slice());
+      aes_ige_encrypt(as_slice(encryption_key_.key()), as_mutable_slice(iv_), bytes.as_slice(),
+                      bytes.as_mutable_slice());
       next_offset_ += static_cast<int64>(bytes.size());
     } else {
       if (part.id >= static_cast<int32>(iv_map_.size())) {
@@ -265,7 +272,8 @@ Result<std::pair<NetQueryPtr, bool>> FileUploader::start_part(Part part, int32 p
       }
       CHECK(part.id < static_cast<int32>(iv_map_.size()) && part.id >= 0);
       auto iv = iv_map_[part.id];
-      aes_ige_encrypt(as_slice(encryption_key_.key()), as_slice(iv), bytes.as_slice(), bytes.as_slice());
+      aes_ige_encrypt(as_slice(encryption_key_.key()), as_mutable_slice(iv), bytes.as_slice(),
+                      bytes.as_mutable_slice());
     }
   }
 
@@ -277,24 +285,21 @@ Result<std::pair<NetQueryPtr, bool>> FileUploader::start_part(Part part, int32 p
   if (big_flag_) {
     auto query =
         telegram_api::upload_saveBigFilePart(file_id_, part.id, local_is_ready_ ? part_count : -1, std::move(bytes));
-    net_query = G()->net_query_creator().create(query, DcId::main(), NetQuery::Type::Upload);
+    net_query = G()->net_query_creator().create(query, {}, DcId::main(), NetQuery::Type::Upload);
   } else {
     auto query = telegram_api::upload_saveFilePart(file_id_, part.id, std::move(bytes));
-    net_query = G()->net_query_creator().create(query, DcId::main(), NetQuery::Type::Upload);
+    net_query = G()->net_query_creator().create(query, {}, DcId::main(), NetQuery::Type::Upload);
   }
   net_query->file_type_ = narrow_cast<int32>(file_type_);
   return std::make_pair(std::move(net_query), false);
 }
 
 Result<size_t> FileUploader::process_part(Part part, NetQueryPtr net_query) {
-  if (net_query->is_error()) {
-    return std::move(net_query->error());
-  }
   Result<bool> result = [&] {
     if (big_flag_) {
-      return fetch_result<telegram_api::upload_saveBigFilePart>(net_query->ok());
+      return fetch_result<telegram_api::upload_saveBigFilePart>(std::move(net_query));
     } else {
-      return fetch_result<telegram_api::upload_saveFilePart>(net_query->ok());
+      return fetch_result<telegram_api::upload_saveFilePart>(std::move(net_query));
     }
   }();
   if (result.is_error()) {
@@ -302,7 +307,7 @@ Result<size_t> FileUploader::process_part(Part part, NetQueryPtr net_query) {
   }
   if (!result.ok()) {
     // TODO: it is possible
-    return Status::Error(500, "Internal Server Error");
+    return Status::Error(500, "Internal Server Error during file upload");
   }
   return part.size;
 }
@@ -318,6 +323,7 @@ void FileUploader::on_progress(Progress progress) {
                      local_size_);
   }
 }
+
 FileLoader::Callback *FileUploader::get_callback() {
   return static_cast<FileLoader::Callback *>(callback_.get());
 }

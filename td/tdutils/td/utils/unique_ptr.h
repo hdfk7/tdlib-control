@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2020
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -21,8 +21,8 @@ class unique_ptr final {
   using element_type = T;
 
   unique_ptr() noexcept = default;
-  unique_ptr(const unique_ptr &other) = delete;
-  unique_ptr &operator=(const unique_ptr &other) = delete;
+  unique_ptr(const unique_ptr &) = delete;
+  unique_ptr &operator=(const unique_ptr &) = delete;
   unique_ptr(unique_ptr &&other) noexcept : ptr_(other.release()) {
   }
   unique_ptr &operator=(unique_ptr &&other) noexcept {
@@ -99,7 +99,7 @@ bool operator!=(const unique_ptr<T> &p, std::nullptr_t) {
 }
 
 template <class Type, class... Args>
-unique_ptr<Type> make_unique(Args &&... args) {
+unique_ptr<Type> make_unique(Args &&...args) {
   return unique_ptr<Type>(new Type(std::forward<Args>(args)...));
 }
 
